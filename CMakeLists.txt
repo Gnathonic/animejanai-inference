@@ -1,38 +1,51 @@
 cmake_minimum_required(VERSION 3.24)
-project(animejanai-inference LANGUAGES C CXX CUDA)
+project(animejanai-inference LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    # Ship kernels for every supported GPU generation (Turing..Blackwell), NOT
-    # "native": native builds only for the build machine's GPU, so the shipped
-    # binary dies with "no kernel image is available for execution on the device"
-    # on every other architecture (e.g. built on a 5090/sm120 => fails on a
-    # 4090/sm89). The trailing -virtual emits PTX so future archs JIT-compile.
-    # Keep in sync with the TensorRT builder packs (sm75/80/86/89/90/100/120).
-    # Local dev can still override with -DCMAKE_CUDA_ARCHITECTURES=native.
-    set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 89-real 90-real 100-real 120-real 120-virtual)
-endif()
 
-# TensorRT location (default: userland dpkg -x extract on Linux; on Windows
-# pass -DAJI_TRT_ROOT=<dir with nvinfer_10.dll, nvinfer_10.lib, include/>).
-if(WIN32)
-    set(AJI_TRT_ROOT "" CACHE PATH "TensorRT root")
-    set(AJI_TRT_INCLUDE "${AJI_TRT_ROOT}/include")
-    set(AJI_TRT_LIB "${AJI_TRT_ROOT}")
-    set(AJI_NVINFER "nvinfer_10" CACHE STRING
-        "nvinfer import library name (nvinfer_10 / nvinfer_11)")
+# CUDA is optional. The TensorRT backend (aji_trt) and its CUDA harness/parity tools
+# build only when a CUDA toolchain is present; the vendor-neutral Vulkan/ncnn backend
+# (aji_vk, the Linux/AMD path) needs no CUDA, so this project configures on a plain
+# Linux box with just a C/C++ compiler.
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        # Ship kernels for every supported GPU generation (Turing..Blackwell), NOT
+        # "native": native builds only for the build machine's GPU, so the shipped
+        # binary dies with "no kernel image is available for execution on the device"
+        # on every other architecture (e.g. built on a 5090/sm120 => fails on a
+        # 4090/sm89). The trailing -virtual emits PTX so future archs JIT-compile.
+        # Keep in sync with the TensorRT builder packs (sm75/80/86/89/90/100/120).
+        # Local dev can still override with -DCMAKE_CUDA_ARCHITECTURES=native.
+        set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 89-real 90-real 100-real 120-real 120-virtual)
+    endif()
+    find_package(CUDAToolkit REQUIRED)
+    set(AJI_HAVE_CUDA ON)
+
+    # TensorRT location (default: userland dpkg -x extract on Linux; on Windows
+    # pass -DAJI_TRT_ROOT=<dir with nvinfer_10.dll, nvinfer_10.lib, include/>).
+    if(WIN32)
+        set(AJI_TRT_ROOT "" CACHE PATH "TensorRT root")
+        set(AJI_TRT_INCLUDE "${AJI_TRT_ROOT}/include")
+        set(AJI_TRT_LIB "${AJI_TRT_ROOT}")
+        set(AJI_NVINFER "nvinfer_10" CACHE STRING
+            "nvinfer import library name (nvinfer_10 / nvinfer_11)")
+    else()
+        set(AJI_TRT_ROOT "$ENV{HOME}/sdk/tensorrt/usr" CACHE PATH "TensorRT root")
+        set(AJI_TRT_INCLUDE "${AJI_TRT_ROOT}/include/x86_64-linux-gnu")
+        set(AJI_TRT_LIB "${AJI_TRT_ROOT}/lib/x86_64-linux-gnu")
+        set(AJI_NVINFER nvinfer)
+    endif()
 else()
-    set(AJI_TRT_ROOT "$ENV{HOME}/sdk/tensorrt/usr" CACHE PATH "TensorRT root")
-    set(AJI_TRT_INCLUDE "${AJI_TRT_ROOT}/include/x86_64-linux-gnu")
-    set(AJI_TRT_LIB "${AJI_TRT_ROOT}/lib/x86_64-linux-gnu")
-    set(AJI_NVINFER nvinfer)
+    message(STATUS "No CUDA toolchain found; skipping the TensorRT backend (aji_trt) "
+                   "and CUDA tools. The Vulkan/ncnn backend (aji_vk) still builds.")
 endif()
-
-find_package(CUDAToolkit REQUIRED)
 
 # aji: thin dispatcher (what the mpv filter loads as lib=). Parses the
 # conf's [global] backend key and forwards the C ABI to the sibling
@@ -44,6 +57,7 @@ set_target_properties(aji PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CXX_VISIBILITY_PRESET hidden)
 
+if(AJI_HAVE_CUDA)
 # aji_trt: TensorRT/CUDA backend (the former aji.dll).
 add_library(aji_trt SHARED src/aji_trt.cpp src/aji_conf.cpp src/kernels.cu)
 target_include_directories(aji_trt
@@ -77,8 +91,6 @@ set_target_properties(aji_harness PROPERTIES
 if(WIN32)
     set(AJI_FFMPEG_ROOT "" CACHE PATH "ffmpeg dev root (include/, lib/)")
     if(AJI_FFMPEG_ROOT)
-        # The .manifest embeds <activeCodePage>UTF-8</activeCodePage> so the exe's
-        # argv/fopen/CreateProcessA handle Unicode (non-ASCII) file paths correctly.
         add_executable(aji_encode src/encode.c src/aji_encode.manifest)
         target_include_directories(aji_encode PRIVATE "${AJI_FFMPEG_ROOT}/include")
         target_link_directories(aji_encode PRIVATE "${AJI_FFMPEG_ROOT}/lib")
@@ -107,6 +119,7 @@ else()
         message(STATUS "ffmpeg/libav not found via pkg-config; skipping aji_encode target")
     endif()
 endif()
+endif()  # AJI_HAVE_CUDA
 
 # aji_dml: DirectML backend (Windows only). Needs the ONNX Runtime
 # DirectML headers (Microsoft.ML.OnnxRuntime.DirectML nupkg) and the
@@ -131,8 +144,48 @@ if(WIN32)
     add_dependencies(aji_harness_dml aji_dml)
 endif()
 
+if(AJI_HAVE_CUDA)
 # Parity test tool: compiles the kernels directly (the shared lib hides
 # the launcher symbols), no TensorRT dependency.
 add_executable(aji_kernel_test src/kernel_test.c src/kernels.cu)
 target_include_directories(aji_kernel_test PRIVATE include src)
 target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)
+endif()
+
+# aji_vk: Vulkan + ncnn backend (vendor-neutral; the Linux/AMD real-time path).
+# Loaded directly by the mpv filter as lib=libaji_vk.so. Needs a vendored ncnn build
+# tree (AJI_NCNN_ROOT, containing src/ headers and build/src/libncnn.so), Vulkan, and
+# OpenMP (for the CPU color path). Built only when those are found, so a CUDA-only or
+# bare configure simply skips it.
+set(AJI_NCNN_ROOT "/tmp/ncnn-src" CACHE PATH "vendored ncnn source+build root")
+find_library(AJI_NCNN_LIB NAMES ncnn
+    PATHS "${AJI_NCNN_ROOT}/build/src" "${AJI_NCNN_ROOT}/build/install/lib"
+    NO_DEFAULT_PATH)
+# Just the Vulkan loader (libvulkan.so); ncnn vendors its own Vulkan headers, so the
+# full Vulkan SDK / find_package(Vulkan) is not required.
+find_library(AJI_VULKAN_LIB NAMES vulkan)
+find_package(OpenMP)
+if(AJI_NCNN_LIB AND AJI_VULKAN_LIB)
+    add_library(aji_vk SHARED src/aji_vk.cpp src/aji_conf.cpp)
+    target_include_directories(aji_vk
+        PUBLIC include
+        PRIVATE src "${AJI_NCNN_ROOT}/src" "${AJI_NCNN_ROOT}/build/src")
+    target_link_libraries(aji_vk PRIVATE ${AJI_NCNN_LIB} ${AJI_VULKAN_LIB})
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(aji_vk PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    # $ORIGIN: the shipped lib finds its co-located libncnn.so.1 with no
+    # LD_LIBRARY_PATH. hidden visibility + AJI_EXPORT exposes only the aji_* ABI.
+    set_target_properties(aji_vk PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden
+        BUILD_RPATH "$ORIGIN"
+        INSTALL_RPATH "$ORIGIN")
+    if(NOT WIN32)
+        # bind internal aji_* refs locally so a sibling dispatcher can't interpose
+        target_link_options(aji_vk PRIVATE -Wl,-Bsymbolic)
+    endif()
+else()
+    message(STATUS "ncnn (AJI_NCNN_ROOT=${AJI_NCNN_ROOT}) or libvulkan not found; "
+                   "skipping aji_vk. Build it standalone with build_aji_vk.sh.")
+endif()
