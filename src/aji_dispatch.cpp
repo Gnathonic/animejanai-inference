@@ -195,6 +195,8 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     const char *stem = "aji_trt";
     if (lower == "directml") {
         stem = "aji_dml";
+    } else if (lower == "vulkan") {
+        stem = "aji_vk";   /* vendor-neutral ncnn-Vulkan backend (Linux/AMD/Intel) */
     } else if (lower == "ncnn") {
         logf_to(params->log, params->log_opaque, 2,
                 "backend=NCNN is retired; using DirectML instead");
