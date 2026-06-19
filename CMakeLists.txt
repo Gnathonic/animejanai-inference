@@ -152,6 +152,10 @@ target_include_directories(aji_kernel_test PRIVATE include src)
 target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)
 endif()
 
+# RIFE self-test harness: standalone CPU unit tests (no GPU required).
+add_executable(rife_selftest src/rife_selftest.cpp)
+target_include_directories(rife_selftest PRIVATE src)
+
 # The ncnn-Vulkan backend (aji_vk) is retired: ~7-9x slower than MIGraphX on these
 # models, so it didn't stand up as the AMD path. aji_rocm (below) replaces it; NVIDIA
 # on Linux is served by aji_trt (TensorRT).
