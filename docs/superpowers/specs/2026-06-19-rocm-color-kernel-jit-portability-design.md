@@ -2,7 +2,18 @@
 
 **Date:** 2026-06-19
 **Repo:** `animejanai-inference` (engine). Packaging touches in `animejanai-linux`.
-**Status:** Approved design, pre-implementation.
+**Status:** Implemented (Tasks 1–5 complete, 2026-06-19).
+
+Two remaining MANUAL acceptance steps (require hardware not available on the
+build box):
+- **Cross-GPU run:** boot the installed tarball on a second AMD arch (any
+  `gfx` other than `gfx1201`) and confirm GPU color runs, a new
+  `aji_color.<arch>.<hash>.co` appears in `animejanai/cache/`, and playback
+  is correct. No rebuild, no CPU fallback expected.
+- **Real-player default cache dir:** play a video through the full mpv/ROCm
+  stack (not just `aji_rocm_color_test`) and confirm the `.co` file lands in
+  `animejanai/cache/` next to the installed engine libs (the `dladdr`-based
+  default path), without setting `AJI_ROCM_CACHE_DIR`.
 
 ## Problem
 
