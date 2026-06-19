@@ -210,6 +210,15 @@ if(AJI_MIGRAPHX_LIB AND AJI_HIP_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraph
     if(OpenMP_CXX_FOUND)
         target_link_libraries(aji_rocm_color_test PRIVATE OpenMP::OpenMP_CXX)
     endif()
+
+    # RIFE end-to-end gate (tasks A8/A9): links libaji_rocm.so, drives the engine
+    # through a RIFE-only conf chain, waits for the first-run compile, and asserts
+    # the engine loads, aji_rife_factor reports the configured factor, aji_infer_rife
+    # interpolates a valid frame, and a hard cut returns AJI_SCENE. Host frames only
+    # (aji_rocm planes are host pointers) so it needs no resample.h / f16c flags.
+    add_executable(rife_harness test/rife_harness.cpp)
+    target_include_directories(rife_harness PRIVATE include src)
+    target_link_libraries(rife_harness PRIVATE aji_rocm)
 else()
     message(STATUS "MIGraphX (${AJI_ROCM_ROOT} libmigraphx_c) not found; skipping aji_rocm.")
 endif()
