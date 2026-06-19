@@ -1356,10 +1356,107 @@ AJI_EXPORT int aji_poll(aji_ctx* c) {
     return 1;
 }
 
-AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame*, const aji_frame*, double,
-                              const aji_frame*, void*) {
-    if (c) c->err = "RIFE not supported in aji_rocm yet (P7)";
-    return AJI_ERR;
+// Per-frame RIFE interpolation (4:2:0, SYNCHRONOUS). Produces the frame at timestep
+// `t in (0,1)` between A and B. The `stream` arg is NULL on the sw path and ignored —
+// aji_rocm always syncs on its own eval before returning. Returns:
+//   AJI_OK         — `out` written (interpolated frame).
+//   AJI_SCENE      — scene change detected; `out` left UNTOUCHED (caller duplicates A).
+//   AJI_ERR_FORMAT / AJI_ERR_SHAPE / AJI_ERR — invalid input or eval failure.
+// Color is forced BT.709 inside rife_cpu (range follows the source); the eval binding
+// mirrors run_chain (bind the MODEL's params[].dev; the RifeState dev_in/dev_out are
+// Phase-B scaffolding and are left untouched here).
+AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame* a, const aji_frame* b,
+                              double t, const aji_frame* out, void* /*stream*/) {
+    if (!c || !c->rife.loaded) { if (c) c->err = "rife not loaded"; return AJI_ERR; }
+    auto& R = c->rife;
+
+    // 1. Validate: formats equal and 4:2:0; dims equal the RIFE geometry's source w x h.
+    if (a->format != b->format || a->format != out->format) {
+        c->err = "rife fmt mismatch"; return AJI_ERR_FORMAT;
+    }
+    if (a->format != AJI_FMT_NV12 && a->format != AJI_FMT_P010) {
+        c->err = "rife needs nv12/p010"; return AJI_ERR_FORMAT;
+    }
+    if (a->width != R.g.w || a->height != R.g.h ||
+        b->width != R.g.w || b->height != R.g.h ||
+        out->width != R.g.w || out->height != R.g.h) {
+        c->err = "rife dim mismatch"; return AJI_ERR_SHAPE;
+    }
+
+    const int pw = R.g.pw, ph = R.g.ph;
+    const size_t plane = (size_t)pw * ph;
+
+    // 2. Scene detect on the UNPADDED luma (plane[0]), raw container values. norm scales
+    // the container range; divisor (pw*ph) is the PADDED area (in the helper). A scene
+    // change skips interpolation: return AJI_SCENE with `out` untouched (caller dups A).
+    const double norm = (a->format == AJI_FMT_P010) ? 1.0 / 65472.0 : 1.0 / 255.0;
+    bool scene;
+    if (a->format == AJI_FMT_P010) {
+        scene = rife_cpu::scene_detect((const uint16_t*)a->plane[0], a->stride[0],
+                                       (const uint16_t*)b->plane[0], b->stride[0],
+                                       R.g.w, R.g.h, pw, ph, norm, R.scd_threshold);
+    } else {
+        scene = rife_cpu::scene_detect((const uint8_t*)a->plane[0], a->stride[0],
+                                       (const uint8_t*)b->plane[0], b->stride[0],
+                                       R.g.w, R.g.h, pw, ph, norm, R.scd_threshold);
+    }
+    if (scene) return AJI_SCENE;
+
+    // 3. Assemble the 11-ch fp32 tensor. Consts (ch7-10) are already in R.assembly (set
+    // once by setup_rife). A -> ch0-2, B -> ch3-5 (BT.709 + bilinear chroma upsample,
+    // centered into pw x ph with black borders); ch6 <- the timestep plane.
+    rife_cpu::yuv420_to_rgb_planes(*a, R.g, R.assembly.data(), 0, (aji_range)a->range);
+    rife_cpu::yuv420_to_rgb_planes(*b, R.g, R.assembly.data(), 1, (aji_range)a->range);
+    float* ch6 = R.assembly.data() + 6 * plane;
+    for (size_t i = 0; i < plane; ++i) ch6[i] = (float)t;   // (_Float16)t below = RNE, TRT parity
+
+    // 4. fp32 -> fp16 the full 11-ch tensor into pinned host staging.
+    half_t* hin = R.pin_in.get(11 * plane);
+    if (!hin) { c->err = "rife pinned host alloc failed (in)"; return AJI_ERR; }
+    const float* ab = R.assembly.data();
+    const long nin = (long)(11 * plane);
+    #pragma omp parallel for schedule(static) num_threads(color_nt(c, nin))
+    for (long i = 0; i < nin; ++i) hin[i] = (half_t)ab[i];
+
+    // 5. H2D into the model's input param; eval + device sync under gpu_eval_mtx (the
+    // upscale worker shares the device-wide sync). Bind every param's device buffer with
+    // its fp16 shape, exactly like run_chain. Capture outs[0] inside the lock; D2H after.
+    MgxModel* nm = R.model.get();
+    migraphx::argument outs_arg;
+    try {
+        migraphx::program_parameters pp;
+        for (auto& p : nm->params) {
+            if (p.is_input) {
+                if (hipMemcpy(p.dev, hin, p.bytes, hipMemcpyHostToDevice) != hipSuccess) {
+                    c->err = "rife hipMemcpy H2D failed"; return AJI_ERR;
+                }
+            }
+            migraphx::shape sh(migraphx_shape_half_type, p.dims);
+            pp.add(p.name.c_str(), migraphx::argument(sh, p.dev));
+        }
+        {
+            std::lock_guard<std::mutex> lk(c->gpu_eval_mtx);
+            auto outs = nm->prog.eval(pp);     // run the RIFE graph (MIGraphX API, not code-eval)
+            hipDeviceSynchronize();            // eval is async on the GPU stream; wait before D2H
+            outs_arg = outs[0];
+        }
+    } catch (const std::exception& e) {
+        c->err = std::string("rife eval failed: ") + e.what(); return AJI_ERR;
+    }
+
+    // 6. D2H the 3-ch output into pinned host staging, fp16 -> fp32, then crop the centered
+    // w x h window into `out` (BT.709 RGB->YUV + bilinear chroma downsample, range follows A).
+    half_t* hout = R.pin_out.get(3 * plane);
+    if (!hout) { c->err = "rife pinned host alloc failed (out)"; return AJI_ERR; }
+    if (hipMemcpy(hout, outs_arg.data(), nm->out_bytes, hipMemcpyDeviceToHost) != hipSuccess) {
+        c->err = "rife hipMemcpy D2H failed"; return AJI_ERR;
+    }
+    std::vector<float> rgb(3 * plane);
+    const long nout = (long)(3 * plane);
+    #pragma omp parallel for schedule(static) num_threads(color_nt(c, nout))
+    for (long i = 0; i < nout; ++i) rgb[i] = (float)hout[i];
+    rife_cpu::rgb_planes_to_yuv420(rgb.data(), R.g, *(aji_frame*)out, (aji_range)a->range);
+    return AJI_OK;
 }
 
 AJI_EXPORT const char* aji_last_error(aji_ctx* c) { return c ? c->err.c_str() : "null ctx"; }
