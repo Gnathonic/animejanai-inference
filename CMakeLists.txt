@@ -166,25 +166,29 @@ find_library(AJI_MIGRAPHX_LIB NAMES migraphx_c PATHS "${AJI_ROCM_ROOT}/lib")
 find_library(AJI_HIP_LIB NAMES amdhip64 PATHS "${AJI_ROCM_ROOT}/lib")
 find_package(OpenMP)
 if(AJI_MIGRAPHX_LIB AND AJI_HIP_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraphx/migraphx.hpp")
-    # GPU-resident color (Phase B): aji_rocm_color.hip holds the YUV<->RGB + chroma
-    # resample kernels (hipcc); the .cpp stays CXX (g++). gfx1201 = RDNA4 (RX 9070 XT).
-    if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
-        set(CMAKE_HIP_ARCHITECTURES gfx1201)
-    endif()
-    enable_language(HIP)
-    add_library(aji_rocm SHARED src/aji_rocm.cpp src/aji_rocm_color.hip src/aji_conf.cpp)
+    # GPU-resident color (Phase B): aji_rocm_color_device.hip holds the YUV<->RGB +
+    # chroma resample kernels; they are JIT-compiled per-GPU with hipRTC at runtime
+    # (src/aji_rocm_color.cpp), so libaji_rocm.so embeds NO device code and runs on any
+    # AMD arch. Embed the device source as a string for the JIT loader.
+    find_library(AJI_HIPRTC_LIB NAMES hiprtc PATHS "${AJI_ROCM_ROOT}/lib")
+    set(AJI_COLOR_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/aji_rocm_color_device.hip)
+    set(AJI_COLOR_GEN ${CMAKE_CURRENT_BINARY_DIR}/gen/aji_rocm_color_device_src.h)
+    add_custom_command(
+        OUTPUT ${AJI_COLOR_GEN}
+        COMMAND ${CMAKE_COMMAND} -DIN=${AJI_COLOR_SRC} -DOUT=${AJI_COLOR_GEN}
+                -DVAR=AJI_ROCM_COLOR_SRC -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake
+        DEPENDS ${AJI_COLOR_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake
+        COMMENT "Embedding aji_rocm_color device source")
+    add_library(aji_rocm SHARED src/aji_rocm.cpp src/aji_rocm_color.cpp src/aji_conf.cpp ${AJI_COLOR_GEN})
     target_include_directories(aji_rocm
         PUBLIC include
-        PRIVATE src "${AJI_ROCM_ROOT}/include")
-    # -mf16c/-mavx2 so the per-frame fp32<->fp16 RGB casts vectorize (vcvtps2ph/ph2ps).
-    # Scope to CXX so they aren't passed to hipcc (clang) for the .hip source.
-    target_compile_options(aji_rocm PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mf16c -mavx2 -mfma>)
+        PRIVATE src ${CMAKE_CURRENT_BINARY_DIR}/gen "${AJI_ROCM_ROOT}/include")
+    target_compile_options(aji_rocm PRIVATE -mf16c -mavx2 -mfma)
     target_compile_definitions(aji_rocm PRIVATE __HIP_PLATFORM_AMD__)
-    target_link_libraries(aji_rocm PRIVATE ${AJI_MIGRAPHX_LIB} ${AJI_HIP_LIB})
+    target_link_libraries(aji_rocm PRIVATE ${AJI_MIGRAPHX_LIB} ${AJI_HIP_LIB} ${AJI_HIPRTC_LIB})
     if(OpenMP_CXX_FOUND)
         target_link_libraries(aji_rocm PRIVATE OpenMP::OpenMP_CXX)
     endif()
-    # hidden visibility + AJI_EXPORT exposes only the aji_* ABI; rpath finds libmigraphx.
     set_target_properties(aji_rocm PROPERTIES
         POSITION_INDEPENDENT_CODE ON
         CXX_VISIBILITY_PRESET hidden
@@ -195,12 +199,11 @@ if(AJI_MIGRAPHX_LIB AND AJI_HIP_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraph
     endif()
 
     # Characterization test for the GPU out-color kernels (golden regression).
-    add_executable(aji_rocm_color_test test/rocm_color_test.cpp src/aji_rocm_color.hip)
-    set_source_files_properties(src/aji_rocm_color.hip PROPERTIES LANGUAGE HIP)
-    target_include_directories(aji_rocm_color_test PRIVATE include src "${AJI_ROCM_ROOT}/include")
-    target_compile_options(aji_rocm_color_test PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mf16c -mavx2 -mfma>)
+    add_executable(aji_rocm_color_test test/rocm_color_test.cpp src/aji_rocm_color.cpp ${AJI_COLOR_GEN})
+    target_include_directories(aji_rocm_color_test PRIVATE include src ${CMAKE_CURRENT_BINARY_DIR}/gen "${AJI_ROCM_ROOT}/include")
+    target_compile_options(aji_rocm_color_test PRIVATE -mf16c -mavx2 -mfma)
     target_compile_definitions(aji_rocm_color_test PRIVATE __HIP_PLATFORM_AMD__)
-    target_link_libraries(aji_rocm_color_test PRIVATE ${AJI_HIP_LIB})
+    target_link_libraries(aji_rocm_color_test PRIVATE ${AJI_HIP_LIB} ${AJI_HIPRTC_LIB})
     if(OpenMP_CXX_FOUND)
         target_link_libraries(aji_rocm_color_test PRIVATE OpenMP::OpenMP_CXX)
     endif()

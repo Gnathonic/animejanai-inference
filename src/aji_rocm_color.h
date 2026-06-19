@@ -1,8 +1,9 @@
-// Host-callable launchers for the GPU-resident color kernels (Phase B). Compiled from
-// aji_rocm_color.hip with hipcc; called from aji_rocm.cpp (g++). All pointers are DEVICE
-// pointers unless noted. The chroma resample weights match resample.h's spline36 exactly
-// (computed on the host with aji_resample::compute and uploaded), so the GPU color is
-// visually identical to the CPU gpu_pre/gpu_post path.
+// Host-callable launchers for the GPU-resident color kernels (Phase B). The device
+// kernels are compiled for the present GPU with hipRTC at runtime (see
+// src/aji_rocm_color.cpp); these launchers are called from aji_rocm.cpp. All pointers
+// are DEVICE pointers unless noted. The chroma resample weights match resample.h's
+// spline36 exactly (computed on the host with aji_resample::compute and uploaded), so
+// the GPU color is visually identical to the CPU gpu_pre/gpu_post path.
 #pragma once
 #include <cstddef>
 #include <cstdint>
