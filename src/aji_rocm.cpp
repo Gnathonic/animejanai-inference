@@ -30,6 +30,7 @@
 #include "aji_conf.h"
 #include "resample.h"
 #include "aji_rocm_color.h"   // GPU-resident color kernels (Phase B)
+#include "rife_cpu.h"
 
 #include <migraphx/migraphx.hpp>
 #include <hip/hip_runtime_api.h>
@@ -229,6 +230,22 @@ struct aji_ctx {
     // 1080p->4K case); gated by AJI_ROCM_GPU_COLOR. gc holds the device state.
     bool gpu_color_eligible = false;
     GpuColor gc;
+
+    // RIFE interpolation state. Populated by setup_rife (A8); used by aji_infer_rife (A9).
+    struct RifeState {
+        std::unique_ptr<MgxModel> model;
+        rife_cpu::Geom g{};
+        int    num = 1, den = 1;
+        double scd_threshold = 0.150;
+        bool   before_upscale = true, enabled = false, loaded = false;
+        void*  dev_in = nullptr; void* dev_out = nullptr;     // 11*plane*2 / 3*plane*2 bytes
+        PinnedHalf pin_in, pin_out;                            // dedicated pinned host fp16
+        std::vector<float> assembly;                           // 11*plane fp32 (consts + per-frame)
+        // dedicated color scratch (resample plans + temp planes) added in A5 wiring
+    };
+    RifeState rife;
+    std::string rife_model_dir;
+    std::mutex gpu_eval_mtx;
 };
 
 static void logmsg(aji_ctx* c, int level, const char* m) {
@@ -709,17 +726,22 @@ static int run_chain(aji_ctx* c, RgbMat& rgb_in, RgbMat& rgb_out, std::string* e
                     pp.add(p.name.c_str(), migraphx::argument(sh, p.dev));
                 }
                 auto _ge = std::chrono::steady_clock::now();
-                auto outs = nm->prog.eval(pp);   // run the inference graph (MIGraphX API, not code-eval)
-                hipDeviceSynchronize();           // eval is async on the GPU stream; wait before D2H
+                migraphx::argument outs_arg;
+                {
+                    std::lock_guard<std::mutex> lk(c->gpu_eval_mtx);
+                    auto outs = nm->prog.eval(pp);   // run the inference graph (MIGraphX API, not code-eval)
+                    hipDeviceSynchronize();           // eval is async on the GPU stream; wait before D2H
+                    outs_arg = outs[0];
+                }
                 if (getenv("AJI_ROCM_TIMING")) { static double te=0; static long ne=0;
                     te += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_ge).count();
                     if (++ne % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/eval] eval+sync=%.1fms\n", te/ne); }
-                auto osh = outs[0].get_shape().lengths();
+                auto osh = outs_arg.get_shape().lengths();
                 if (osh.size() < 4) { if (errmsg) *errmsg = "bad output rank"; return AJI_ERR_SHAPE; }
                 const int OW = (int)osh[3], OH = (int)osh[2];
                 half_t* od = c->scratch.mdl_out.get((size_t)3 * OW * OH);
                 if (!od) { if (errmsg) *errmsg = "pinned host alloc failed (out)"; return AJI_ERR; }
-                if (hipMemcpy(od, outs[0].data(), nm->out_bytes, hipMemcpyDeviceToHost) != hipSuccess) {
+                if (hipMemcpy(od, outs_arg.data(), nm->out_bytes, hipMemcpyDeviceToHost) != hipSuccess) {
                     if (errmsg) *errmsg = "hipMemcpy D2H failed"; return AJI_ERR;
                 }
                 alt->create(OW, OH, 3);
@@ -802,49 +824,57 @@ static int run_chain_gpu(aji_ctx* c, RgbMat& rgb_in, const aji_frame* out,
             pp.add(p.name.c_str(), migraphx::argument(sh, p.dev));
         }
         auto _ge = std::chrono::steady_clock::now();
-        auto outs = nm->prog.eval(pp);   // inference graph (MIGraphX), not code-eval
-        if (hipDeviceSynchronize() != hipSuccess) { if (errmsg) *errmsg = "eval sync failed"; return AJI_ERR; }
-        if (getenv("AJI_ROCM_TIMING")) { static double te=0; static long ne=0;
-            te += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_ge).count();
-            if (++ne % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/eval] eval+sync=%.1fms\n", te/ne); }
-        auto oshape = outs[0].get_shape();
-        auto osh = oshape.lengths();
-        if (osh.size() < 4) { if (errmsg) *errmsg = "bad output rank"; return AJI_ERR_SHAPE; }
-        const int OW = (int)osh[3], OH = (int)osh[2];
-        if (OW != c->out_w || OH != c->out_h) { if (errmsg) *errmsg = "gpu-color out dims mismatch"; return AJI_ERR_SHAPE; }
-        if (getenv("AJI_ROCM_GPU_COLOR_DEBUG")) {
-            static bool once = false;
-            if (!once) { once = true;
-                auto st = oshape.strides();
-                fprintf(stderr, "[gpucolor] out lengths={%zu,%zu,%zu,%zu} strides={",
-                        osh[0],osh[1],osh[2],osh[3]);
-                for (auto s : st) fprintf(stderr, "%zu,", s);
-                fprintf(stderr, "} bytes=%zu  packedWHx3=%zu\n", oshape.bytes(), (size_t)3*OW*OH*2);
+        int OW = 0, OH = 0;
+        {
+            std::lock_guard<std::mutex> lk(c->gpu_eval_mtx);
+            // eval→gpu-out-color→final sync all on the default stream: one lock covers both.
+            auto outs = nm->prog.eval(pp);   // inference graph (MIGraphX), not code-eval
+            if (hipDeviceSynchronize() != hipSuccess) { if (errmsg) *errmsg = "eval sync failed"; return AJI_ERR; }
+            if (getenv("AJI_ROCM_TIMING")) { static double te=0; static long ne=0;
+                te += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_ge).count();
+                if (++ne % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/eval] eval+sync=%.1fms\n", te/ne); }
+            auto oshape = outs[0].get_shape();
+            auto osh = oshape.lengths();
+            if (osh.size() < 4) { if (errmsg) *errmsg = "bad output rank"; return AJI_ERR_SHAPE; }
+            OW = (int)osh[3]; OH = (int)osh[2];
+            if (OW != c->out_w || OH != c->out_h) { if (errmsg) *errmsg = "gpu-color out dims mismatch"; return AJI_ERR_SHAPE; }
+            if (getenv("AJI_ROCM_GPU_COLOR_DEBUG")) {
+                static bool once = false;
+                if (!once) { once = true;
+                    auto st = oshape.strides();
+                    fprintf(stderr, "[gpucolor] out lengths={%zu,%zu,%zu,%zu} strides={",
+                            osh[0],osh[1],osh[2],osh[3]);
+                    for (auto s : st) fprintf(stderr, "%zu,", s);
+                    fprintf(stderr, "} bytes=%zu  packedWHx3=%zu\n", oshape.bytes(), (size_t)3*OW*OH*2);
+                }
             }
+            if (!gpu_color_ensure(c, OW, OH, ofmt, omat, orng)) { if (errmsg) *errmsg = "gpu color setup failed"; return AJI_ERR; }
+            GpuColor& gc = c->gc;
+            if (const char* dp = getenv("AJI_ROCM_DUMP")) {   // debug: dump model in/out fp16 to isolate non-determinism
+                std::string pin = std::string(dp) + ".in", pout = std::string(dp) + ".out";
+                FILE* fi = fopen(pin.c_str(), "wb"); if (fi) { fwrite(ib, sizeof(half_t), n, fi); fclose(fi); }
+                std::vector<half_t> ob((size_t)3 * OW * OH);
+                hipMemcpy(ob.data(), outs[0].data(), ob.size() * sizeof(half_t), hipMemcpyDeviceToHost);
+                FILE* fo = fopen(pout.c_str(), "wb"); if (fo) { fwrite(ob.data(), sizeof(half_t), ob.size(), fo); fclose(fo); }
+            }
+            auto _gc = std::chrono::steady_clock::now();
+            aji_gpu_out_color(outs[0].data(), OW, OH, gc.csp,
+                gc.ph_start, gc.ph_wt, gc.ph_taps, gc.pv_start, gc.pv_wt, gc.pv_taps,
+                gc.Un, gc.Vn, gc.hu, gc.hv, gc.yplane, gc.uvplane, nullptr);
+            if (hipDeviceSynchronize() != hipSuccess) { if (errmsg) *errmsg = "gpu out-color failed"; return AJI_ERR; }
+            if (getenv("AJI_ROCM_TIMING")) { static double tg=0; static long ng=0;
+                tg += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_gc).count();
+                if (++ng % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/gpucolor] out-color+D2H=%.1fms\n", tg/ng); }
+        }  // gpu_eval_mtx released here; D2H copies below use c->gc.yplane/c->gc.uvplane (stable)
+        {
+            GpuColor& gc = c->gc;
+            const int cw = OW >> 1, ch = OH >> 1;
+            const int bytes = gc.csp.is_p010 ? 2 : 1;
+            ptrdiff_t ys  = out->stride[0] ? out->stride[0] : (ptrdiff_t)OW * bytes;
+            ptrdiff_t uvs = out->stride[1] ? out->stride[1] : (ptrdiff_t)cw * 2 * bytes;
+            if (hipMemcpy2D(out->plane[0], ys, gc.yplane, (size_t)OW*bytes, (size_t)OW*bytes, OH, hipMemcpyDeviceToHost) != hipSuccess) { if (errmsg) *errmsg = "D2H Y failed"; return AJI_ERR; }
+            if (hipMemcpy2D(out->plane[1], uvs, gc.uvplane, (size_t)cw*2*bytes, (size_t)cw*2*bytes, ch, hipMemcpyDeviceToHost) != hipSuccess) { if (errmsg) *errmsg = "D2H UV failed"; return AJI_ERR; }
         }
-        if (!gpu_color_ensure(c, OW, OH, ofmt, omat, orng)) { if (errmsg) *errmsg = "gpu color setup failed"; return AJI_ERR; }
-        GpuColor& gc = c->gc;
-        if (const char* dp = getenv("AJI_ROCM_DUMP")) {   // debug: dump model in/out fp16 to isolate non-determinism
-            std::string pin = std::string(dp) + ".in", pout = std::string(dp) + ".out";
-            FILE* fi = fopen(pin.c_str(), "wb"); if (fi) { fwrite(ib, sizeof(half_t), n, fi); fclose(fi); }
-            std::vector<half_t> ob((size_t)3 * OW * OH);
-            hipMemcpy(ob.data(), outs[0].data(), ob.size() * sizeof(half_t), hipMemcpyDeviceToHost);
-            FILE* fo = fopen(pout.c_str(), "wb"); if (fo) { fwrite(ob.data(), sizeof(half_t), ob.size(), fo); fclose(fo); }
-        }
-        auto _gc = std::chrono::steady_clock::now();
-        aji_gpu_out_color(outs[0].data(), OW, OH, gc.csp,
-            gc.ph_start, gc.ph_wt, gc.ph_taps, gc.pv_start, gc.pv_wt, gc.pv_taps,
-            gc.Un, gc.Vn, gc.hu, gc.hv, gc.yplane, gc.uvplane, nullptr);
-        if (hipDeviceSynchronize() != hipSuccess) { if (errmsg) *errmsg = "gpu out-color failed"; return AJI_ERR; }
-        const int cw = OW >> 1, ch = OH >> 1;
-        const int bytes = gc.csp.is_p010 ? 2 : 1;
-        ptrdiff_t ys  = out->stride[0] ? out->stride[0] : (ptrdiff_t)OW * bytes;
-        ptrdiff_t uvs = out->stride[1] ? out->stride[1] : (ptrdiff_t)cw * 2 * bytes;
-        if (hipMemcpy2D(out->plane[0], ys, gc.yplane, (size_t)OW*bytes, (size_t)OW*bytes, OH, hipMemcpyDeviceToHost) != hipSuccess) { if (errmsg) *errmsg = "D2H Y failed"; return AJI_ERR; }
-        if (hipMemcpy2D(out->plane[1], uvs, gc.uvplane, (size_t)cw*2*bytes, (size_t)cw*2*bytes, ch, hipMemcpyDeviceToHost) != hipSuccess) { if (errmsg) *errmsg = "D2H UV failed"; return AJI_ERR; }
-        if (getenv("AJI_ROCM_TIMING")) { static double tg=0; static long ng=0;
-            tg += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_gc).count();
-            if (++ng % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/gpucolor] out-color+D2H=%.1fms\n", tg/ng); }
     } catch (const std::exception& e) {
         if (errmsg) *errmsg = std::string("gpu chain failed: ") + e.what(); return AJI_ERR;
     }
@@ -910,6 +940,8 @@ AJI_EXPORT aji_ctx* aji_create(const aji_create_params* p) {
     c->nthreads = std::max(1, std::min(8, omp_get_max_threads()));
     c->nthreads_max = std::max(1, omp_get_max_threads());
 #endif
+
+    if (p->rife_model_dir) c->rife_model_dir = p->rife_model_dir;
 
     if (p->conf_path && p->conf_path[0]) {
         c->conf_mode = true;
