@@ -16,5 +16,15 @@ inline std::string model_name(int code, bool ensemble) {
     return name;
 }
 
+struct Geom { int w, h, pw, ph, pad_l, pad_t; };
+inline Geom geometry(int w, int h) {
+    Geom g; g.w = w; g.h = h;
+    g.pw = (w + 63) / 64 * 64;
+    g.ph = (h + 63) / 64 * 64;
+    g.pad_l = ((g.pw - w) / 2) & ~1;           // centered, rounded down to even
+    g.pad_t = ((g.ph - h) / 2) & ~1;
+    return g;
+}
+
 // (functions added in A2, A3, A6, A7)
 }  // namespace rife_cpu
