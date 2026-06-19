@@ -31,6 +31,7 @@
 #include "resample.h"
 
 #include <migraphx/migraphx.hpp>
+#include <hip/hip_runtime_api.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -41,6 +42,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <chrono>   // AJI_ROCM_TIMING per-stage instrumentation
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -56,24 +58,48 @@ using half_t = _Float16;
 struct RgbMat {
     int w = 0, h = 0, c = 0;
     std::vector<float> buf;
-    void create(int W, int H, int C) { w = W; h = H; c = C; buf.assign((size_t)W * H * C, 0.f); }
+    // resize (NOT assign): every element is overwritten downstream, so zeroing is wasted;
+    // and when this buffer is ctx-pooled and reused at a constant resolution, resize to the
+    // same size is a no-op (no per-frame 100MB malloc/memset churn).
+    void create(int W, int H, int C) { w = W; h = H; c = C; buf.resize((size_t)W * H * C); }
     float* channel(int k) { return buf.data() + (size_t)k * w * h; }
     const float* channel(int k) const { return buf.data() + (size_t)k * w * h; }
 };
 
-// A MIGraphX program compiled for one model at one input shape. The chain may use the
-// same model at different resolutions, so programs are keyed by (path, in_w, in_h).
+// A MIGraphX program compiled for one model at one input shape (keyed by path,in_w,in_h),
+// with persistent device buffers so each frame is a bare eval + two hipMemcpys — no
+// per-eval allocation (the offload_copy path's ~60ms/frame tax at 4K).
 struct MgxModel {
     migraphx::program prog;
-    std::string in_name;
-    int in_w = 0, in_h = 0;
+    // Every program parameter (input + "main:#output_0" [+ scratch]) gets one device
+    // buffer, allocated once. Rebuilt into program_parameters each frame.
+    struct Param { std::string name; void* dev = nullptr; size_t bytes = 0;
+                   std::vector<std::size_t> dims; bool is_input = false; };
+    std::vector<Param> params;
+    std::string in_name = "input";
+    int in_w = 0, in_h = 0, out_w = 0, out_h = 0;
+    size_t out_bytes = 0;
     int scale = 0;
+    ~MgxModel() { for (auto& p : params) if (p.dev) hipFree(p.dev); }
 };
 
 struct Step {
     enum Kind { RESIZE, MODEL } kind;
     int out_w = 0, out_h = 0;
     int model_idx = -1;   // MODEL
+};
+
+// Pinned (page-locked) host fp16 buffer for the model in/out copies — DMA hipMemcpy
+// (~25GB/s) instead of pageable (~3GB/s), which is ~17ms/frame at 4K. Grows on demand.
+struct PinnedHalf {
+    half_t* ptr = nullptr; size_t cap = 0;
+    half_t* get(size_t n) {
+        if (n > cap) { if (ptr) hipHostFree(ptr);
+            if (hipHostMalloc((void**)&ptr, n * sizeof(half_t)) != hipSuccess) ptr = nullptr;
+            cap = ptr ? n : 0; }
+        return ptr;
+    }
+    ~PinnedHalf() { if (ptr) hipHostFree(ptr); }
 };
 
 struct aji_ctx {
@@ -105,7 +131,9 @@ struct aji_ctx {
         std::vector<float> t0u, t0v, t1u, t1v;          // pre chroma upsample
         std::vector<float> rt0;                         // resize H intermediate
         std::vector<float> Yout, Un, Vn, hu, hv, uvout; // post
-        std::vector<half_t> mdl_in;                     // fp32 RGB -> fp16 model input
+        PinnedHalf mdl_in;                              // fp32 RGB -> fp16 model input (pinned)
+        PinnedHalf mdl_out;                             // fp16 model output (dev->host, pinned)
+        RgbMat rgbA, rgbB;                              // ping-pong RGB buffers (reused per frame)
     } scratch;
 
     // CPU-color OpenMP width. Capped: on small frames the per-region spawn/sync
@@ -137,7 +165,7 @@ static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_
     m->in_name = "input";   // the SPAN dynamo export's input blob name
 
     const std::string cache = onnx_path + "." + std::to_string(in_w) + "x" +
-                              std::to_string(in_h) + ".fp16.mxr";
+                              std::to_string(in_h) + ".dev.fp16.mxr";
     try {
         std::ifstream probe(cache, std::ios::binary);
         if (probe.good()) {
@@ -147,7 +175,7 @@ static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_
             oo.set_input_parameter_shape(m->in_name, {1, 3, (size_t)in_h, (size_t)in_w});
             m->prog = migraphx::parse_onnx(onnx_path.c_str(), oo);
             migraphx::quantize_fp16(m->prog);
-            migraphx::compile_options co; co.set_offload_copy(true);  // host<->device auto
+            migraphx::compile_options co; co.set_offload_copy(false);  // device-resident
             m->prog.compile(migraphx::target("gpu"), co);
             migraphx::save(m->prog, cache.c_str());
         }
@@ -156,18 +184,29 @@ static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_
         return nullptr;
     }
 
-    // Spatial scale = output_h / input_h, from a one-time zero-input eval (also a warm-up).
+    // One device buffer per program parameter (input + main:#output_0 [+ scratch]),
+    // allocated once. The output is the 4D non-input param; scale = out_h / in_h.
     try {
-        std::vector<uint16_t> zero((size_t)3 * in_h * in_w, 0);  // fp16 zeros
-        migraphx::shape s(migraphx_shape_half_type, {1, 3, (size_t)in_h, (size_t)in_w});
-        migraphx::program_parameters pp;
-        pp.add(m->in_name.c_str(), migraphx::argument(s, zero.data()));
-        auto outs = m->prog.eval(pp);
-        auto osh = outs[0].get_shape().lengths();   // {1,3,OH,OW}
-        if (osh.size() < 4 || osh[2] % (size_t)in_h != 0) { c->err = "unexpected model output shape"; return nullptr; }
-        m->scale = (int)(osh[2] / (size_t)in_h);
+        auto ps = m->prog.get_parameter_shapes();
+        for (auto&& name : ps.names()) {
+            auto sh = ps[name];
+            MgxModel::Param p;
+            p.name = name;
+            p.bytes = sh.bytes();
+            p.dims = sh.lengths();
+            p.is_input = (p.name == m->in_name);
+            if (hipMalloc(&p.dev, p.bytes) != hipSuccess || !p.dev) {
+                c->err = "hipMalloc failed for param " + p.name; return nullptr;
+            }
+            if (!p.is_input && p.dims.size() == 4) {
+                m->out_h = (int)p.dims[2]; m->out_w = (int)p.dims[3]; m->out_bytes = p.bytes;
+            }
+            m->params.push_back(std::move(p));
+        }
+        if (m->out_h <= 0 || m->out_h % in_h != 0) { c->err = "model output shape not a scale of input"; return nullptr; }
+        m->scale = m->out_h / in_h;
     } catch (const std::exception& e) {
-        c->err = "migraphx scale probe failed: " + std::string(e.what());
+        c->err = "migraphx param setup failed: " + std::string(e.what());
         return nullptr;
     }
     return m;
@@ -496,6 +535,13 @@ AJI_EXPORT int aji_infer(aji_ctx* c, const aji_frame* in, const aji_frame* out, 
     if (format != AJI_FMT_NV12 && format != AJI_FMT_P010) { c->err = "aji_infer: unsupported input format"; return AJI_ERR_FORMAT; }
     if (out_format != AJI_FMT_NV12 && out_format != AJI_FMT_P010) { c->err = "aji_infer: unsupported output format"; return AJI_ERR_FORMAT; }
 
+    // TEMP: env-gated per-stage timing (AJI_ROCM_TIMING=1).
+    static const bool kT = getenv("AJI_ROCM_TIMING") != nullptr;
+    static double tPre=0, tModel=0, tPost=0; static long tN=0;
+    auto _now = []{ return std::chrono::steady_clock::now(); };
+    auto _ms  = [](auto a, auto b){ return std::chrono::duration<double,std::milli>(b-a).count(); };
+    auto _t0 = _now();
+
     // Color is done on CPU (resample.h, bit-exact reference) — no GPU color init
     // needed. (The GLSL kernels in color_init are kept for the future P4
     // GPU-resident path but are not on the critical path and corrupt at scale.)
@@ -530,53 +576,84 @@ AJI_EXPORT int aji_infer(aji_ctx* c, const aji_frame* in, const aji_frame* out, 
         }
     }
 
-    // ---- GLSL pre: YUV -> RGB fp32 NCHW ----
-    RgbMat cur;
-    if (gpu_pre(c, W, H, format, matrix, range, siting, Yf, Uf, Vf, cur) != AJI_OK) {
+    // ---- CPU pre: YUV -> RGB fp32 NCHW (into a pooled ping-pong buffer) ----
+    RgbMat* cur = &c->scratch.rgbA;
+    RgbMat* alt = &c->scratch.rgbB;
+    if (gpu_pre(c, W, H, format, matrix, range, siting, Yf, Uf, Vf, *cur) != AJI_OK) {
         logmsg(c, 2, c->err.c_str()); return AJI_ERR;
     }
+    auto _t1 = _now();   // end of input color
 
-    // ---- model chain + resize steps (RGB fp32 NCHW throughput) ----
+    // ---- model chain + resize steps (RGB fp32 NCHW; ping-pong the two pooled buffers
+    // so nothing reallocates per frame) ----
     for (const Step& st : c->steps) {
         if (st.kind == Step::RESIZE) {
-            RgbMat dst;
-            if (gpu_resize(c, cur, st.out_w, st.out_h, dst) != AJI_OK) { logmsg(c, 2, c->err.c_str()); return AJI_ERR; }
-            cur = std::move(dst);
+            if (gpu_resize(c, *cur, st.out_w, st.out_h, *alt) != AJI_OK) { logmsg(c, 2, c->err.c_str()); return AJI_ERR; }
+            std::swap(cur, alt);
         } else {
             MgxModel* nm = c->models[st.model_idx].get();
-            const int IW = cur.w, IH = cur.h;
+            const int IW = cur->w, IH = cur->h;
             const size_t n = (size_t)3 * IW * IH;
-            // fp32 RGB NCHW -> fp16 (the model input dtype); reuse ctx scratch.
-            // OpenMP + -mf16c so the bulk cast vectorizes (vcvtps2ph), not a scalar tax.
-            std::vector<half_t>& in16 = c->scratch.mdl_in; in16.resize(n);
-            const float* cb = cur.buf.data(); half_t* ib = in16.data();
+            // fp32 RGB NCHW -> fp16 (the model input dtype); pinned + -mf16c vectorized.
+            half_t* ib = c->scratch.mdl_in.get(n);
+            if (!ib) { c->err = "pinned host alloc failed (in)"; return AJI_ERR; }
+            const float* cb = cur->buf.data();
             #pragma omp parallel for schedule(static) num_threads(c->nthreads)
             for (long i = 0; i < (long)n; i++) ib[i] = (half_t)cb[i];
 
-            migraphx::shape is(migraphx_shape_half_type, {1, 3, (size_t)IH, (size_t)IW});
-            migraphx::program_parameters pp;
-            pp.add(nm->in_name.c_str(), migraphx::argument(is, in16.data()));
+            // Device-resident eval: copy fp16 input to its persistent device buffer, bind
+            // every param's device buffer, run (writes into main:#output_0), copy back.
             try {
-                auto outs = nm->prog.eval(pp);   // offload_copy -> output is on the host
+                migraphx::program_parameters pp;
+                for (auto& p : nm->params) {
+                    if (p.is_input) {
+                        if (hipMemcpy(p.dev, ib, p.bytes, hipMemcpyHostToDevice) != hipSuccess) {
+                            c->err = "hipMemcpy H2D failed"; return AJI_ERR;
+                        }
+                    }
+                    migraphx::shape sh(migraphx_shape_half_type, p.dims);
+                    pp.add(p.name.c_str(), migraphx::argument(sh, p.dev));
+                }
+                auto _ge = std::chrono::steady_clock::now();
+                auto outs = nm->prog.eval(pp);
+                hipDeviceSynchronize();   // eval is async on the GPU stream; wait before D2H
+                if (getenv("AJI_ROCM_TIMING")) { static double te=0; static long ne=0;
+                    te += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_ge).count();
+                    if (++ne % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/eval] eval+sync=%.1fms\n", te/ne); }
                 auto osh = outs[0].get_shape().lengths();   // {1,3,OH,OW}
                 if (osh.size() < 4) { c->err = "infer: bad output rank"; return AJI_ERR_SHAPE; }
                 const int OW = (int)osh[3], OH = (int)osh[2];
-                const half_t* od = (const half_t*)outs[0].data();
-                RgbMat o; o.create(OW, OH, 3);
-                float* ob = o.buf.data(); const long on = (long)3 * OW * OH;
+                half_t* od = c->scratch.mdl_out.get((size_t)3 * OW * OH);
+                if (!od) { c->err = "pinned host alloc failed (out)"; return AJI_ERR; }
+                if (hipMemcpy(od, outs[0].data(), nm->out_bytes, hipMemcpyDeviceToHost) != hipSuccess) {
+                    c->err = "hipMemcpy D2H failed"; return AJI_ERR;
+                }
+                alt->create(OW, OH, 3);
+                float* ob = alt->buf.data(); const long on = (long)3 * OW * OH;
                 #pragma omp parallel for schedule(static) num_threads(c->nthreads)
                 for (long i = 0; i < on; i++) ob[i] = (float)od[i];
-                cur = std::move(o);
+                std::swap(cur, alt);
             } catch (const std::exception& e) {
                 c->err = std::string("infer eval failed: ") + e.what(); return AJI_ERR;
             }
         }
     }
-    if (cur.w != c->out_w || cur.h != c->out_h || cur.c < 3) { c->err = "infer: unexpected output dims"; return AJI_ERR_SHAPE; }
+    if (cur->w != c->out_w || cur->h != c->out_h || cur->c < 3) { c->err = "infer: unexpected output dims"; return AJI_ERR_SHAPE; }
+    auto _t2 = _now();   // end of model chain
 
     // ---- CPU post: RGB fp32 NCHW -> host YUV ----
-    if (gpu_post(c, cur, out_format, out_matrix, out_range, out) != AJI_OK) {
+    if (gpu_post(c, *cur, out_format, out_matrix, out_range, out) != AJI_OK) {
         logmsg(c, 2, c->err.c_str()); return AJI_ERR;
+    }
+    if (kT) {
+        tPre += _ms(_t0,_t1); tModel += _ms(_t1,_t2); tPost += _ms(_t2,_now()); tN++;
+        if (tN % 50 == 0) {
+            double tot = tPre+tModel+tPost;
+            fprintf(stderr, "[AJI_ROCM_TIMING] n=%ld  in-color=%.1fms (%.0f%%)  "
+                "model=%.1fms (%.0f%%)  out-color=%.1fms (%.0f%%)  total=%.1fms => %.1f fps\n",
+                tN, tPre/tN, 100*tPre/tot, tModel/tN, 100*tModel/tot, tPost/tN, 100*tPost/tot,
+                tot/tN, 1000.0/(tot/tN));
+        }
     }
     return AJI_OK;
 }

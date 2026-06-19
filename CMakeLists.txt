@@ -196,15 +196,17 @@ endif()
 # resample.h (OpenMP). Needs MIGraphX (libmigraphx_c) + ROCm at AJI_ROCM_ROOT.
 set(AJI_ROCM_ROOT "/opt/rocm" CACHE PATH "ROCm install root (migraphx headers + libs)")
 find_library(AJI_MIGRAPHX_LIB NAMES migraphx_c PATHS "${AJI_ROCM_ROOT}/lib")
+find_library(AJI_HIP_LIB NAMES amdhip64 PATHS "${AJI_ROCM_ROOT}/lib")
 find_package(OpenMP)
-if(AJI_MIGRAPHX_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraphx/migraphx.hpp")
+if(AJI_MIGRAPHX_LIB AND AJI_HIP_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraphx/migraphx.hpp")
     add_library(aji_rocm SHARED src/aji_rocm.cpp src/aji_conf.cpp)
     target_include_directories(aji_rocm
         PUBLIC include
         PRIVATE src "${AJI_ROCM_ROOT}/include")
     # -mf16c/-mavx2 so the per-frame fp32<->fp16 RGB casts vectorize (vcvtps2ph/ph2ps).
     target_compile_options(aji_rocm PRIVATE -mf16c -mavx2 -mfma)
-    target_link_libraries(aji_rocm PRIVATE ${AJI_MIGRAPHX_LIB})
+    target_compile_definitions(aji_rocm PRIVATE __HIP_PLATFORM_AMD__)
+    target_link_libraries(aji_rocm PRIVATE ${AJI_MIGRAPHX_LIB} ${AJI_HIP_LIB})
     if(OpenMP_CXX_FOUND)
         target_link_libraries(aji_rocm PRIVATE OpenMP::OpenMP_CXX)
     endif()
