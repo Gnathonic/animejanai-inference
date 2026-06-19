@@ -9,6 +9,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hiprtc.h>
 #include <dlfcn.h>
+#include <filesystem>
 #include <fstream>
 #include <cstdlib>
 #include <cstring>
@@ -64,7 +65,7 @@ bool read_file(const std::string& p, std::vector<char>& out) {
 void write_file_atomic(const std::string& p, const std::vector<char>& data) {
     // best-effort: mkdir the cache dir, write tmp, rename. Failure just means recompile next time.
     std::string dir = p.substr(0, p.find_last_of('/'));
-    std::string mk = "mkdir -p '" + dir + "'"; (void)system(mk.c_str());
+    std::error_code ec; std::filesystem::create_directories(dir, ec);  // best-effort; ofstream open below fails -> recompile next time
     std::string tmp = p + ".tmp";
     { std::ofstream f(tmp, std::ios::binary); if (!f) return; f.write(data.data(), (std::streamsize)data.size()); }
     if (std::rename(tmp.c_str(), p.c_str()) != 0) std::remove(tmp.c_str());
