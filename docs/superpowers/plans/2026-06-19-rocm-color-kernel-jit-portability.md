@@ -84,14 +84,8 @@ static std::vector<unsigned short> make_rgb_fp16() {
                 f[((size_t)c * OH + y) * OW + x] =
                     0.5f + 0.5f * std::sin(0.07f * x + 0.11f * y + 1.3f * c);
     std::vector<unsigned short> h(f.size());
-    // host fp32->fp16 via the device to avoid a separate half impl
-    float* df; unsigned short* dh;
-    hipMalloc(&df, f.size() * sizeof(float));
-    hipMalloc(&dh, f.size() * sizeof(unsigned short));
-    hipMemcpy(df, f.data(), f.size() * sizeof(float), hipMemcpyHostToDevice);
-    // reuse: cast on host instead (no kernel) — _Float16 is a host type with -mf16c
+    // host fp32->fp16: _Float16 is a host type under -mf16c, store its 2 bytes
     for (size_t i = 0; i < f.size(); i++) { _Float16 v = (_Float16)f[i]; std::memcpy(&h[i], &v, 2); }
-    hipFree(df); hipFree(dh);
     return h;
 }
 
