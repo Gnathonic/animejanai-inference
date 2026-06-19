@@ -8,4 +8,4 @@ sanity/saxpy
 
 # Linux Vulkan backend build artifacts
 /build/
-libaji_vk.so
+libaji_rocm.so

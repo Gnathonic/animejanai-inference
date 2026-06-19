@@ -8,8 +8,8 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # CUDA is optional. The TensorRT backend (aji_trt) and its CUDA harness/parity tools
-# build only when a CUDA toolchain is present; the vendor-neutral Vulkan/ncnn backend
-# (aji_vk, the Linux/AMD path) needs no CUDA, so this project configures on a plain
+# build only when a CUDA toolchain is present; the ROCm/MIGraphX backend (aji_rocm)
+# needs no CUDA either, so this project configures on a plain
 # Linux box with just a C/C++ compiler.
 include(CheckLanguage)
 check_language(CUDA)
@@ -44,7 +44,7 @@ if(CMAKE_CUDA_COMPILER)
     endif()
 else()
     message(STATUS "No CUDA toolchain found; skipping the TensorRT backend (aji_trt) "
-                   "and CUDA tools. The Vulkan/ncnn backend (aji_vk) still builds.")
+                   "and CUDA tools. The ROCm/MIGraphX backend (aji_rocm) still builds.")
 endif()
 
 # aji: thin dispatcher (what the mpv filter loads as lib=). Parses the
@@ -152,43 +152,10 @@ target_include_directories(aji_kernel_test PRIVATE include src)
 target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)
 endif()
 
-# aji_vk: Vulkan + ncnn backend (vendor-neutral; the Linux/AMD real-time path).
-# Loaded directly by the mpv filter as lib=libaji_vk.so. Needs a vendored ncnn build
-# tree (AJI_NCNN_ROOT, containing src/ headers and build/src/libncnn.so), Vulkan, and
-# OpenMP (for the CPU color path). Built only when those are found, so a CUDA-only or
-# bare configure simply skips it.
-set(AJI_NCNN_ROOT "/tmp/ncnn-src" CACHE PATH "vendored ncnn source+build root")
-find_library(AJI_NCNN_LIB NAMES ncnn
-    PATHS "${AJI_NCNN_ROOT}/build/src" "${AJI_NCNN_ROOT}/build/install/lib"
-    NO_DEFAULT_PATH)
-# Just the Vulkan loader (libvulkan.so); ncnn vendors its own Vulkan headers, so the
-# full Vulkan SDK / find_package(Vulkan) is not required.
-find_library(AJI_VULKAN_LIB NAMES vulkan)
+# The ncnn-Vulkan backend (aji_vk) is retired: ~7-9x slower than MIGraphX on these
+# models, so it didn't stand up as the AMD path. aji_rocm (below) replaces it; NVIDIA
+# on Linux is served by aji_trt (TensorRT).
 find_package(OpenMP)
-if(AJI_NCNN_LIB AND AJI_VULKAN_LIB)
-    add_library(aji_vk SHARED src/aji_vk.cpp src/aji_conf.cpp)
-    target_include_directories(aji_vk
-        PUBLIC include
-        PRIVATE src "${AJI_NCNN_ROOT}/src" "${AJI_NCNN_ROOT}/build/src")
-    target_link_libraries(aji_vk PRIVATE ${AJI_NCNN_LIB} ${AJI_VULKAN_LIB})
-    if(OpenMP_CXX_FOUND)
-        target_link_libraries(aji_vk PRIVATE OpenMP::OpenMP_CXX)
-    endif()
-    # $ORIGIN: the shipped lib finds its co-located libncnn.so.1 with no
-    # LD_LIBRARY_PATH. hidden visibility + AJI_EXPORT exposes only the aji_* ABI.
-    set_target_properties(aji_vk PROPERTIES
-        POSITION_INDEPENDENT_CODE ON
-        CXX_VISIBILITY_PRESET hidden
-        BUILD_RPATH "$ORIGIN"
-        INSTALL_RPATH "$ORIGIN")
-    if(NOT WIN32)
-        # bind internal aji_* refs locally so a sibling dispatcher can't interpose
-        target_link_options(aji_vk PRIVATE -Wl,-Bsymbolic)
-    endif()
-else()
-    message(STATUS "ncnn (AJI_NCNN_ROOT=${AJI_NCNN_ROOT}) or libvulkan not found; "
-                   "skipping aji_vk. Build it standalone with build_aji_vk.sh.")
-endif()
 
 # aji_rocm: AMD ROCm/MIGraphX backend (the Linux/AMD real-time path; ~7-9x faster than
 # the retired ncnn-Vulkan aji_vk, TensorRT-class). Loaded by the dispatcher as
