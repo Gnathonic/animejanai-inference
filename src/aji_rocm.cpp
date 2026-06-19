@@ -242,6 +242,22 @@ struct aji_ctx {
         PinnedHalf pin_in, pin_out;                            // dedicated pinned host fp16
         std::vector<float> assembly;                           // 11*plane fp32 (consts + per-frame)
         // dedicated color scratch (resample plans + temp planes) added in A5 wiring
+
+        // Free the device tensors (the MgxModel and the pinned/assembly buffers free
+        // themselves via their own dtors). Called on reconfigure and from ~RifeState.
+        void free_dev() {
+            if (dev_in)  { hipFree(dev_in);  dev_in  = nullptr; }
+            if (dev_out) { hipFree(dev_out); dev_out = nullptr; }
+        }
+        // Reconfigure-safe reset: drop the model + device buffers and disable, so stale
+        // RIFE state never leaks across an aji_configure that changes/removes RIFE.
+        void reset() {
+            free_dev();
+            model.reset();
+            assembly.clear();
+            enabled = loaded = false;
+        }
+        ~RifeState() { free_dev(); }
     };
     RifeState rife;
     std::string rife_model_dir;
@@ -648,12 +664,122 @@ static int ensure_model(aji_ctx* c, const std::string& onnx, const std::string& 
     return sc;
 }
 
+// Configure RIFE interpolation for the active chain (called from build_plan, replacing
+// the old "not supported" drop). Mirrors ensure_model's async-build cascade, but the
+// compiled engine lands in c->rife.model (NOT c->models — it is driven by aji_infer_rife,
+// not the upscale step loop) and there is no spatial scale. The RIFE .mxr rides the SAME
+// single-build slot as the upscale engines, so a cold-cache upscale+RIFE chain cascades
+// one compile per poll->reconfigure cycle.
+//   LOADED   — engine on disk + loaded; rife.enabled && rife.loaded; interpolation live.
+//   DEFERRED — engine compiling on the background worker; passthrough (no interp) until
+//              cached; build_plan must return 0 (c->log carries the build marker).
+//   DISABLED — RIFE off (no model dir, invalid model code, or a load/shape error); the
+//              chain continues without interpolation. Never hard-errors the chain.
+enum RifeSetup { RIFE_LOADED, RIFE_DEFERRED, RIFE_DISABLED };
+static RifeSetup setup_rife(aji_ctx* c, const AjiChainConf* chain,
+                            int src_w, int src_h, int cw, int ch,
+                            double /*fps*/, std::string& steps_log) {
+    // Reconfigure-safe: drop any prior RIFE engine/buffers before reconfiguring.
+    c->rife.reset();
+
+    // 1. Geometry — RIFE compiles at the SOURCE shape when before_upscale (interpolate
+    // then upscale every frame), else at the chain-output shape.
+    int rw = chain->rife_before_upscale ? src_w : cw;
+    int rh = chain->rife_before_upscale ? src_h : ch;
+    c->rife.g = rife_cpu::geometry(rw, rh);
+    const int pw = c->rife.g.pw, ph = c->rife.g.ph;
+
+    // 2. Model name. Invalid code or no model dir -> disable (chain continues, no interp).
+    std::string name = rife_cpu::model_name(chain->rife_model, chain->rife_ensemble);
+    if (name.empty() || c->rife_model_dir.empty()) {
+        steps_log += "(RIFE disabled: " +
+                     std::string(name.empty() ? "invalid rife_model code" : "no rife_model_dir") +
+                     "); ";
+        c->rife.enabled = false;
+        return RIFE_DISABLED;
+    }
+    const std::string onnx = c->rife_model_dir + "/" + name + ".onnx";
+
+    // 3. Async-build cascade (mirror ensure_model): an uncached RIFE engine compiles on
+    // the single background build slot; the chain runs passthrough (no interp) meanwhile.
+    if (c->async_build && !mxr_cached(onnx, pw, ph, 11)) {
+        const std::string key = mxr_cache_path(onnx, pw, ph, 11);
+        char res[32]; snprintf(res, sizeof res, "%dx%d", pw, ph);
+        if (c->failed_builds.count(key)) {
+            c->log = "MIGraphX engine build FAILED for " + name + " for " + res +
+                     "; playing without interpolation";
+            // A failed RIFE build degrades to no-interp passthrough, not a deferred
+            // reconfigure: treat as DISABLED so build_plan keeps building the chain.
+            c->rife.enabled = false;
+            return RIFE_DISABLED;
+        }
+        bool building = c->build && c->build->done.load() == 0;
+        if (!building) start_async_build(c, onnx, pw, ph, 11);
+        c->log = "Building MIGraphX engine for " + name + " for " + res +
+                 " (first play at this resolution)";
+        // before_upscale is set now (not just at LOAD) so aji_rife_before_upscale reports
+        // the right value even while deferred; factor still returns 0 until loaded.
+        c->rife.before_upscale = chain->rife_before_upscale;
+        c->rife.enabled = true; c->rife.loaded = false;
+        return RIFE_DEFERRED;
+    }
+
+    // 4. Cached (or sync build inline): load the RIFE engine. load_model hard-asserts the
+    // {1,11,ph,pw} input / {1,3,ph,pw} output shapes for channels==11.
+    auto m = load_model(c, onnx, pw, ph, 11);
+    if (!m) {
+        logmsg(c, 2, c->err.c_str());
+        steps_log += "(RIFE disabled: engine load failed); ";
+        c->rife.enabled = false;
+        return RIFE_DISABLED;
+    }
+    c->rife.model = std::move(m);
+
+    // 5. Dedicated device tensors (fp16) + pinned host staging. free_dev was already
+    // called by reset() above, so no double-allocation.
+    const size_t plane = (size_t)pw * ph;
+    if (hipMalloc(&c->rife.dev_in,  11 * plane * 2) != hipSuccess || !c->rife.dev_in ||
+        hipMalloc(&c->rife.dev_out,  3 * plane * 2) != hipSuccess || !c->rife.dev_out) {
+        c->err = "RIFE: hipMalloc failed for device tensors";
+        logmsg(c, 2, c->err.c_str());
+        c->rife.reset();
+        steps_log += "(RIFE disabled: device alloc failed); ";
+        return RIFE_DISABLED;
+    }
+    c->rife.pin_in.get(11 * plane);
+    c->rife.pin_out.get(3 * plane);
+
+    // 6. Host const template: ch7-10 (mesh/multiplier) filled once; A9 reuses this per
+    // frame and writes ch0-6 (frames + timestep) on top.
+    c->rife.assembly.assign(11 * plane, 0.f);
+    rife_cpu::fill_consts(c->rife.assembly.data(), pw, ph);
+
+    // 7. Carry chain config into the runtime state and mark live.
+    c->rife.num = chain->rife_factor_num;
+    c->rife.den = chain->rife_factor_den;
+    c->rife.scd_threshold = chain->rife_scd_threshold;
+    c->rife.before_upscale = chain->rife_before_upscale;
+    c->rife.enabled = true;
+    c->rife.loaded = true;
+
+    steps_log += "RIFE " + name + " " + std::to_string(chain->rife_factor_num) + "/" +
+                 std::to_string(chain->rife_factor_den) + " interp at " +
+                 std::to_string(rw) + "x" + std::to_string(rh) + " (padded " +
+                 std::to_string(pw) + "x" + std::to_string(ph) + ", " +
+                 (chain->rife_before_upscale ? "pre-upscale" : "post-upscale") + "); ";
+    return RIFE_LOADED;
+}
+
 // Build the step plan for the active chain (conf mode) or single model (direct).
 static int build_plan(aji_ctx* c, int w, int h, double fps) {
     c->models.clear();
     c->steps.clear();
     c->chain_scale = 0;
     c->gpu_color_eligible = false;
+    // Drop any prior RIFE state up front so a reconfigure that removes RIFE (direct mode,
+    // no chain, or a chain without rife=) doesn't leak a stale engine/buffers. setup_rife
+    // re-enables it (and re-resets) when the new chain requests RIFE.
+    c->rife.reset();
     int cw = w, ch = h;
 
     if (!c->conf_mode) {
@@ -724,7 +850,20 @@ static int build_plan(aji_ctx* c, int w, int h, double fps) {
             c->chain_scale = c->chain_scale ? c->chain_scale * sc : sc;
             steps_log += "model " + m.name + " " + std::to_string(sc) + "x -> " + std::to_string(cw) + "x" + std::to_string(ch) + "; ";
         }
-        if (chain->rife) steps_log += "(RIFE requested — not yet supported in aji_rocm); ";
+        // RIFE runs BEFORE the c->active computation below so a RIFE-only chain (zero
+        // upscale models, steps empty -> active=false) still configures interpolation.
+        if (chain->rife) {
+            RifeSetup rs = setup_rife(c, chain, w, h, cw, ch, fps, steps_log);
+            if (rs == RIFE_DEFERRED) {
+                // RIFE engine compiling in the background (c->log carries the build
+                // marker). Mirror the upscale defer at :719-720: passthrough, no active,
+                // until aji_poll() triggers a reconfigure that finds the cached .mxr.
+                c->steps.clear(); c->models.clear();
+                c->in_w = w; c->in_h = h; c->out_w = w; c->out_h = h; c->active = false;
+                return 0;
+            }
+            // LOADED or DISABLED: fall through and finish the plan normally.
+        }
         char hdr[160];
         snprintf(hdr, sizeof hdr, "slot %d chain %d: %dx%d -> %dx%d  [", c->slot, chain->index, w, h, cw, ch);
         c->log = std::string(hdr) + steps_log + "]";
@@ -1192,8 +1331,17 @@ AJI_EXPORT int aji_wait(aji_ctx* c, uint64_t ticket) {
 
 AJI_EXPORT const char* aji_current_log(aji_ctx* c) { return c ? c->log.c_str() : ""; }
 AJI_EXPORT int aji_scale_factor(aji_ctx* c) { return c ? c->chain_scale : 0; }
-AJI_EXPORT int aji_rife_factor(aji_ctx*, int*, int*) { return 0; }
-AJI_EXPORT int aji_rife_before_upscale(aji_ctx*) { return 1; }  // moot: aji_rocm has no RIFE
+// 0 (no interpolation) until the RIFE .mxr is actually loaded — the filter only calls
+// aji_infer_rife when this returns 1, so it must stay 0 while the engine compiles.
+AJI_EXPORT int aji_rife_factor(aji_ctx* c, int* num, int* den) {
+    if (!c || !c->rife.enabled || !c->rife.loaded) return 0;
+    if (num) *num = c->rife.num;
+    if (den) *den = c->rife.den;
+    return 1;
+}
+AJI_EXPORT int aji_rife_before_upscale(aji_ctx* c) {
+    return (c && c->rife.enabled && c->rife.before_upscale) ? 1 : 0;
+}
 // Returns 1 exactly once when a background engine compile has finished (success or
 // failure); the filter then re-runs aji_configure, which finds the now-cached engine
 // (or, on failure, the failed-set marker -> passthrough). 0 if no build, still running,
