@@ -189,3 +189,34 @@ else()
     message(STATUS "ncnn (AJI_NCNN_ROOT=${AJI_NCNN_ROOT}) or libvulkan not found; "
                    "skipping aji_vk. Build it standalone with build_aji_vk.sh.")
 endif()
+
+# aji_rocm: AMD ROCm/MIGraphX backend (the Linux/AMD real-time path; ~7-9x faster than
+# the retired ncnn-Vulkan aji_vk, TensorRT-class). Loaded by the dispatcher as
+# libaji_rocm.so. Runs the SAME fp16 .onnx as aji_trt/aji_dml on MIGraphX; CPU color via
+# resample.h (OpenMP). Needs MIGraphX (libmigraphx_c) + ROCm at AJI_ROCM_ROOT.
+set(AJI_ROCM_ROOT "/opt/rocm" CACHE PATH "ROCm install root (migraphx headers + libs)")
+find_library(AJI_MIGRAPHX_LIB NAMES migraphx_c PATHS "${AJI_ROCM_ROOT}/lib")
+find_package(OpenMP)
+if(AJI_MIGRAPHX_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraphx/migraphx.hpp")
+    add_library(aji_rocm SHARED src/aji_rocm.cpp src/aji_conf.cpp)
+    target_include_directories(aji_rocm
+        PUBLIC include
+        PRIVATE src "${AJI_ROCM_ROOT}/include")
+    # -mf16c/-mavx2 so the per-frame fp32<->fp16 RGB casts vectorize (vcvtps2ph/ph2ps).
+    target_compile_options(aji_rocm PRIVATE -mf16c -mavx2 -mfma)
+    target_link_libraries(aji_rocm PRIVATE ${AJI_MIGRAPHX_LIB})
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(aji_rocm PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    # hidden visibility + AJI_EXPORT exposes only the aji_* ABI; rpath finds libmigraphx.
+    set_target_properties(aji_rocm PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden
+        BUILD_RPATH "${AJI_ROCM_ROOT}/lib"
+        INSTALL_RPATH "$ORIGIN:${AJI_ROCM_ROOT}/lib")
+    if(NOT WIN32)
+        target_link_options(aji_rocm PRIVATE -Wl,-Bsymbolic)
+    endif()
+else()
+    message(STATUS "MIGraphX (${AJI_ROCM_ROOT} libmigraphx_c) not found; skipping aji_rocm.")
+endif()
