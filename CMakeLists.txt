@@ -153,8 +153,10 @@ target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)
 endif()
 
 # RIFE self-test harness: standalone CPU unit tests (no GPU required).
-add_executable(rife_selftest src/rife_selftest.cpp)
-target_include_directories(rife_selftest PRIVATE src)
+add_executable(rife_selftest src/rife_selftest.cpp src/rife_cpu.cpp)
+target_include_directories(rife_selftest PRIVATE src include)
+# rife_cpu.cpp pulls resample.h which uses f16c/AVX intrinsics; match aji_rocm's CXX flags.
+target_compile_options(rife_selftest PRIVATE -mf16c -mavx2 -mfma)
 
 # The ncnn-Vulkan backend (aji_vk) is retired: ~7-9x slower than MIGraphX on these
 # models, so it didn't stand up as the AMD path. aji_rocm (below) replaces it; NVIDIA
@@ -176,7 +178,7 @@ if(AJI_MIGRAPHX_LIB AND AJI_HIP_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraph
         set(CMAKE_HIP_ARCHITECTURES gfx1201)
     endif()
     enable_language(HIP)
-    add_library(aji_rocm SHARED src/aji_rocm.cpp src/aji_rocm_color.hip src/aji_conf.cpp)
+    add_library(aji_rocm SHARED src/aji_rocm.cpp src/aji_rocm_color.hip src/aji_conf.cpp src/rife_cpu.cpp)
     target_include_directories(aji_rocm
         PUBLIC include
         PRIVATE src "${AJI_ROCM_ROOT}/include")
