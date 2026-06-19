@@ -29,6 +29,7 @@
 #include "aji.h"
 #include "aji_conf.h"
 #include "resample.h"
+#include "aji_rocm_color.h"   // GPU-resident color kernels (Phase B)
 
 #include <migraphx/migraphx.hpp>
 #include <hip/hip_runtime_api.h>
@@ -42,6 +43,12 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <atomic>   // async engine compile (async_build)
+#include <thread>
+#include <mutex>    // async inference pipeline (P4 overlap)
+#include <condition_variable>
+#include <deque>
+#include <set>
 #include <chrono>   // AJI_ROCM_TIMING per-stage instrumentation
 #ifdef _OPENMP
 #include <omp.h>
@@ -102,6 +109,44 @@ struct PinnedHalf {
     ~PinnedHalf() { if (ptr) hipHostFree(ptr); }
 };
 
+// One background MIGraphX compile. MIGraphX builds a static per-resolution
+// engine in ~140s; blocking aji_configure on that would freeze the player, so
+// an uncached model compiles on a worker thread while the chain runs
+// passthrough, and aji_poll() reports completion (the filter then reconfigures
+// and the now-cached .mxr loads in ~1s). The worker captures a shared_ptr to
+// this — NOT the aji_ctx — so it never touches ctx state and aji_destroy can
+// detach it without a use-after-free or a shutdown hang. Mirrors aji_trt's
+// async build, so the existing engine_monitor.lua OSD drives both backends.
+struct BuildState {
+    std::string onnx, key;     // .onnx path and its .mxr cache path (the failed-set key)
+    int w = 0, h = 0;          // input shape the engine is compiled for
+    std::atomic<int> done{0};  // 0 running, 1 finished (success or failure)
+    std::atomic<bool> ok{false};
+    std::atomic<bool> reported{false};  // aji_poll has returned 1 for this build
+    std::string err;           // set by the worker; read by main only after done==1
+};
+
+// GPU-resident out-color state (Phase B): device weight tables + scratch + output planes,
+// allocated once per (out W,H,format,matrix,range). The model's fp16 RGB output is colored
+// to NV12/P010 on the GPU here, so the 4K RGB buffer never leaves the device.
+struct GpuColor {
+    bool ready = false;
+    int W = 0, H = 0, fmt = 0, mat = 0, rng = 0;   // what `ready` was built for
+    aji_color_csp csp{};
+    int*   ph_start = nullptr; float* ph_wt = nullptr; int ph_taps = 0;  // W->cw downsample
+    int*   pv_start = nullptr; float* pv_wt = nullptr; int pv_taps = 0;  // H->ch downsample
+    float* Un = nullptr; float* Vn = nullptr;      // device scratch, W*H
+    float* hu = nullptr; float* hv = nullptr;      // device scratch, cw*H
+    void*  yplane = nullptr; void* uvplane = nullptr;  // device output (tight)
+    void free() {
+        for (void* p : {(void*)ph_start,(void*)ph_wt,(void*)pv_start,(void*)pv_wt,
+                        (void*)Un,(void*)Vn,(void*)hu,(void*)hv,yplane,uvplane})
+            if (p) hipFree(p);
+        ph_start=nullptr; ph_wt=nullptr; pv_start=nullptr; pv_wt=nullptr;
+        Un=Vn=hu=hv=nullptr; yplane=uvplane=nullptr; ready=false;
+    }
+};
+
 struct aji_ctx {
     bool conf_mode = false;
 
@@ -146,6 +191,44 @@ struct aji_ctx {
     std::string err, log;
     aji_log_fn logfn = nullptr;
     void* log_opaque = nullptr;
+
+    // async engine compile (filter passes async_build=1; CLI/benchmark leaves it 0).
+    bool async_build = false;
+    std::shared_ptr<BuildState> build;       // current/last background compile, or null
+    std::thread build_thread;
+    std::set<std::string> failed_builds;     // .mxr keys that failed; don't re-kick (avoids a loop)
+
+    // Async inference pipeline (P4 overlap). aji_infer = submit: CPU in-color (gpu_pre, on
+    // the filter thread) -> enqueue; a worker thread runs the GPU model chain; aji_wait =
+    // D2H + CPU out-color (gpu_post, on the filter thread). With the filter pipelining at
+    // depth>1, out-color(N) overlaps eval(N+1). Per-slot rgb_in/rgb_out; the chain scratch
+    // (rgbA/rgbB/rt0/pinned/device) is worker-only-serial so it stays shared; gpu_pre and
+    // gpu_post scratch are filter-thread-only and disjoint from the worker -> no color race.
+    enum { SLOT_FREE = 0, SLOT_SUBMITTED = 1, SLOT_DONE = 2 };
+    struct InferSlot {
+        RgbMat rgb_in, rgb_out;     // in-color output / chain output
+        aji_frame out{};            // where out-color writes (planes valid until wait, via filter outq ref)
+        int ofmt = 0, omat = 0, orng = 0;
+        uint64_t ticket = 0;
+        int state = SLOT_FREE;
+        int err = AJI_OK;
+        bool gpu_colored = false;   // worker already wrote out (GPU out-color); wait skips gpu_post
+        std::string errmsg;
+    };
+    static const int kRing = 4;     // in-flight depth cap (filter depth is small; submit back-pressures if full)
+    InferSlot slots[kRing];
+    std::thread infer_worker;
+    std::mutex infer_mtx;
+    std::condition_variable infer_cv_worker, infer_cv_main;
+    std::deque<int> infer_pending;  // slot indices awaiting the worker
+    uint64_t infer_last_ticket = 0;
+    bool infer_worker_started = false;
+    bool infer_stop = false;
+
+    // GPU-resident out-color (Phase B). Eligible = a single MODEL step, no RESIZE (the
+    // 1080p->4K case); gated by AJI_ROCM_GPU_COLOR. gc holds the device state.
+    bool gpu_color_eligible = false;
+    GpuColor gc;
 };
 
 static void logmsg(aji_ctx* c, int level, const char* m) {
@@ -164,40 +247,89 @@ static int round_even(double x) {
 // onto the GPU (P4), not more CPU threads.
 static inline int color_nt(const aji_ctx* c, long /*npix*/) { return c->nthreads; }
 
-// Compile (or load a cached) MIGraphX fp16 engine for one .onnx at a FIXED input shape.
-// MIGraphX builds a static per-shape engine, so a model used at several resolutions in a
-// chain gets one engine per resolution; each is cached to a .mxr next to the .onnx so the
-// ~17s compile happens once (offline migraphx-driver pre-compilation drops it entirely).
+// The cache file for one engine: <onnx>.<W>x<H>.dev.mlir.fp16.mxr next to the model. The
+// ".mlir" tag invalidates the older MLIR-disabled engines, which had a non-deterministic
+// MIOpen-fallback conv artifact (evenly-spaced column static) at 4K.
+static std::string mxr_cache_path(const std::string& onnx, int w, int h) {
+    return onnx + "." + std::to_string(w) + "x" + std::to_string(h) + ".dev.mlir.fp16.mxr";
+}
+static bool mxr_cached(const std::string& onnx, int w, int h) {
+    std::ifstream probe(mxr_cache_path(onnx, w, h), std::ios::binary);
+    return probe.good();
+}
+
+// Parse + fp16-quantize + GPU-compile one .onnx at a FIXED input shape and save the
+// engine. Touches NO ctx state, so it is safe to run on a worker thread. Writes to a
+// temp file then atomically renames into place, so an interrupted compile (player quit
+// mid-build) never leaves a half-written .mxr that would later fail to load.
+// Returns false + *errout on error.
+static bool compile_mxr(const std::string& onnx_path, int in_w, int in_h, std::string* errout) {
+    try {
+        // MLIR (rocMLIR) is the DEFAULT conv codegen on RDNA and is REQUIRED for correctness:
+        // disabling it falls back to a MIOpen conv solver that reads uninitialized workspace at
+        // 4K and yields non-deterministic, evenly-spaced column static (confirmed: MLIR-off
+        // differs every run, MLIR-on is bit-identical). It costs ~70s more compile (one-time,
+        // behind the progress bar) and ZERO inference fps (measured 32.4 vs 32.5ms). So leave
+        // MLIR on (the 2.15 default); MIGRAPHX_DISABLE_MLIR=1 in the env still forces it off for
+        // experiments. (Dynamic-shape compile is still impossible: the SPAN reflect-pad preamble
+        // has non-constant pads MIGraphX can't parse dynamically.)
+        migraphx::onnx_options oo;
+        oo.set_input_parameter_shape("input", {1, 3, (size_t)in_h, (size_t)in_w});
+        auto prog = migraphx::parse_onnx(onnx_path.c_str(), oo);
+        migraphx::quantize_fp16(prog);
+        migraphx::compile_options co; co.set_offload_copy(false);  // device-resident
+        prog.compile(migraphx::target("gpu"), co);
+        const std::string cache = mxr_cache_path(onnx_path, in_w, in_h);
+        const std::string tmp = cache + ".tmp." + std::to_string(in_w) + "x" + std::to_string(in_h);
+        migraphx::save(prog, tmp.c_str());
+        if (std::rename(tmp.c_str(), cache.c_str()) != 0) {
+            std::remove(tmp.c_str());
+            throw std::runtime_error("could not rename engine into place");
+        }
+        return true;
+    } catch (const std::exception& e) {
+        if (errout) *errout = std::string("migraphx compile failed (") + onnx_path + "): " + e.what();
+        return false;
+    }
+}
+
+// Kick a background compile of one engine; the configure that called this returns
+// passthrough and aji_poll() reports when to reconfigure. The worker captures only a
+// shared_ptr to the BuildState (never the ctx), so it outlives the ctx safely.
+static void start_async_build(aji_ctx* c, const std::string& onnx, int w, int h) {
+    if (c->build_thread.joinable()) c->build_thread.join();  // reap a previous finished worker
+    auto bs = std::make_shared<BuildState>();
+    bs->onnx = onnx; bs->key = mxr_cache_path(onnx, w, h); bs->w = w; bs->h = h;
+    c->build = bs;
+    c->build_thread = std::thread([bs]() {
+        std::string e;
+        bool ok = compile_mxr(bs->onnx, bs->w, bs->h, &e);
+        bs->err = e;
+        bs->ok.store(ok);
+        bs->done.store(1);   // release: main reads ok/err only after seeing done==1
+    });
+}
+
+// Load an engine for one .onnx at a FIXED input shape into an MgxModel. The .mxr must
+// already be on disk (the async path defers an uncached model before reaching here; the
+// sync path compiles it inline first). MIGraphX builds a static per-shape engine, so a
+// model used at several resolutions in a chain gets one engine per resolution.
 static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_path,
                                             int in_w, int in_h) {
     auto m = std::make_unique<MgxModel>();
     m->in_w = in_w; m->in_h = in_h;
     m->in_name = "input";   // the SPAN dynamo export's input blob name
 
-    const std::string cache = onnx_path + "." + std::to_string(in_w) + "x" +
-                              std::to_string(in_h) + ".dev.fp16.mxr";
+    const std::string cache = mxr_cache_path(onnx_path, in_w, in_h);
     try {
-        std::ifstream probe(cache, std::ios::binary);
-        if (probe.good()) {
-            m->prog = migraphx::load(cache.c_str());
-        } else {
-            // MLIR is MIGraphX's kernel-fusion JIT; for these SPAN convs it doesn't speed
-            // inference (measured 14 fps either way) but it dominates the per-resolution
-            // compile (210s -> 141s with it off). Default it off for a faster first play;
-            // a user can re-enable with MIGRAPHX_DISABLE_MLIR=0. (Dynamic-shape compile,
-            // which would compile once for all resolutions, is impossible here: the SPAN
-            // reflect-pad preamble has non-constant pads MIGraphX can't parse dynamically.)
-            setenv("MIGRAPHX_DISABLE_MLIR", "1", 0);
-            migraphx::onnx_options oo;
-            oo.set_input_parameter_shape(m->in_name, {1, 3, (size_t)in_h, (size_t)in_w});
-            m->prog = migraphx::parse_onnx(onnx_path.c_str(), oo);
-            migraphx::quantize_fp16(m->prog);
-            migraphx::compile_options co; co.set_offload_copy(false);  // device-resident
-            m->prog.compile(migraphx::target("gpu"), co);
-            migraphx::save(m->prog, cache.c_str());
+        if (!mxr_cached(onnx_path, in_w, in_h)) {
+            // sync (CLI/benchmark) path: async_build defers before getting here
+            std::string e;
+            if (!compile_mxr(onnx_path, in_w, in_h, &e)) { c->err = e; return nullptr; }
         }
+        m->prog = migraphx::load(cache.c_str());
     } catch (const std::exception& e) {
-        c->err = "migraphx compile failed (" + onnx_path + "): " + e.what();
+        c->err = "migraphx engine load failed (" + cache + "): " + e.what();
         return nullptr;
     }
 
@@ -215,6 +347,14 @@ static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_
             if (hipMalloc(&p.dev, p.bytes) != hipSuccess || !p.dev) {
                 c->err = "hipMalloc failed for param " + p.name; return nullptr;
             }
+            // Zero every device buffer once. With offload_copy=false MIGraphX gives us the
+            // "scratch" workspace param to own; some conv solvers read padding/edge regions
+            // of it that they never write, so an uninitialized (hipMalloc) buffer yields
+            // non-deterministic garbage in evenly-spaced column bands. Zeroing makes those
+            // reads a deterministic 0 (the correct pad value) and kills the artifact.
+            hipMemset(p.dev, 0, p.bytes);
+            if (getenv("AJI_ROCM_GPU_COLOR_DEBUG"))
+                fprintf(stderr, "[param] %s  bytes=%zu  is_input=%d\n", p.name.c_str(), p.bytes, (int)p.is_input);
             if (!p.is_input && p.dims.size() == 4) {
                 m->out_h = (int)p.dims[2]; m->out_w = (int)p.dims[3]; m->out_bytes = p.bytes;
             }
@@ -409,18 +549,52 @@ static int gpu_post(aji_ctx* c, const RgbMat& rgb, int format, int matrix, int r
 
 // ------------------------------- plan --------------------------------------
 
+// Ensure the engine for one model step is ready. In async_build mode an uncached engine
+// is compiled on a worker thread and this returns 0 (the chain runs passthrough until
+// aji_poll() triggers a reconfigure); a build that already failed is not re-kicked. On
+// success the model is pushed into c->models and its scale (>0) returned. Returns -1 on a
+// hard load error. On defer/failure it sets a marker in c->log for engine_monitor.lua.
+// Returns: >0 scale (loaded), 0 deferred to a background build, -1 error.
+static int ensure_model(aji_ctx* c, const std::string& onnx, const std::string& name,
+                        int in_w, int in_h) {
+    if (c->async_build && !mxr_cached(onnx, in_w, in_h)) {
+        const std::string key = mxr_cache_path(onnx, in_w, in_h);
+        char res[32]; snprintf(res, sizeof res, "%dx%d", in_w, in_h);
+        if (c->failed_builds.count(key)) {
+            c->log = "MIGraphX engine build FAILED for " + name + " for " + res +
+                     "; playing without this chain";
+            return 0;
+        }
+        // One build at a time: a multi-engine chain cascades through repeated
+        // poll() -> reconfigure cycles, building the next uncached engine each time.
+        bool building = c->build && c->build->done.load() == 0;
+        if (!building) start_async_build(c, onnx, in_w, in_h);
+        c->log = "Building MIGraphX engine for " + name + " for " + res +
+                 " (first play at this resolution)";
+        return 0;
+    }
+    auto m = load_model(c, onnx, in_w, in_h);
+    if (!m) { logmsg(c, 2, c->err.c_str()); return -1; }
+    int sc = m->scale;
+    c->models.push_back(std::move(m));
+    return sc;
+}
+
 // Build the step plan for the active chain (conf mode) or single model (direct).
 static int build_plan(aji_ctx* c, int w, int h, double fps) {
     c->models.clear();
     c->steps.clear();
     c->chain_scale = 0;
+    c->gpu_color_eligible = false;
     int cw = w, ch = h;
 
     if (!c->conf_mode) {
-        auto m = load_model(c, c->engine_path, cw, ch);
-        if (!m) return AJI_ERR_ENGINE;
-        int sc = m->scale;
-        c->models.push_back(std::move(m));
+        int sc = ensure_model(c, c->engine_path, "engine", cw, ch);
+        if (sc < 0) return AJI_ERR_ENGINE;
+        if (sc == 0) {  // compiling in the background (or build failed) -> passthrough
+            c->in_w = w; c->in_h = h; c->out_w = w; c->out_h = h; c->active = false;
+            return 0;
+        }
         c->steps.push_back({Step::MODEL, w * sc, h * sc, 0});
         cw = w * sc; ch = h * sc;
         c->chain_scale = sc;
@@ -470,10 +644,13 @@ static int build_plan(aji_ctx* c, int w, int h, double fps) {
             }
             if (m.name.empty()) continue;
             std::string onnx = c->model_dir + "/" + m.name + ".onnx";
-            auto nm = load_model(c, onnx, cw, ch);
-            if (!nm) { logmsg(c, 2, c->err.c_str()); return AJI_ERR_ENGINE; }
-            int sc = nm->scale;
-            c->models.push_back(std::move(nm));
+            int sc = ensure_model(c, onnx, m.name, cw, ch);
+            if (sc < 0) return AJI_ERR_ENGINE;
+            if (sc == 0) {  // compiling in the background (or build failed) -> passthrough
+                c->steps.clear(); c->models.clear();
+                c->in_w = w; c->in_h = h; c->out_w = w; c->out_h = h; c->active = false;
+                return 0;   // c->log already carries the build marker
+            }
             cw *= sc; ch *= sc;
             c->steps.push_back({Step::MODEL, cw, ch, (int)c->models.size() - 1});
             c->chain_scale = c->chain_scale ? c->chain_scale * sc : sc;
@@ -487,7 +664,238 @@ static int build_plan(aji_ctx* c, int w, int h, double fps) {
 
     c->in_w = w; c->in_h = h; c->out_w = cw; c->out_h = ch;
     c->active = !c->steps.empty();
+    // GPU-resident out-color applies to a single-model no-resize chain (the 1080p->4K case);
+    // multi-model/resize chains keep the CPU path. On by default (bit-exact vs the CPU path,
+    // verified maxdiff=0 at 720p; ~1.5x at 4K); opt out with AJI_ROCM_GPU_COLOR=0.
+    static const bool gpu_color_off = []{ const char* e = getenv("AJI_ROCM_GPU_COLOR"); return e && e[0] == '0'; }();
+    c->gpu_color_eligible = !gpu_color_off && c->active &&
+                            c->steps.size() == 1 && c->steps[0].kind == Step::MODEL;
     return c->active ? 1 : 0;
+}
+
+// -------------------------- async inference pipeline -----------------------
+
+// Run the model+resize chain on the WORKER thread: rgb_in (RGB fp32 NCHW) -> rgb_out
+// (c->out_w x c->out_h). Ping-pongs between rgb_in (the slot's own buffer, free to reuse
+// after the first step reads it) and the worker-serial scratch rgbA; the final result is
+// O(1)-swapped into rgb_out. Uses only worker-owned scratch (rgbA, rt0 via gpu_resize,
+// mdl_in/mdl_out, device buffers) — never the filter-thread color scratch. Returns AJI_OK
+// or an error code (+ *errmsg). Mirrors the old synchronous chain body exactly.
+static int run_chain(aji_ctx* c, RgbMat& rgb_in, RgbMat& rgb_out, std::string* errmsg) {
+    RgbMat* cur = &rgb_in;
+    RgbMat* alt = &c->scratch.rgbA;
+    for (const Step& st : c->steps) {
+        if (st.kind == Step::RESIZE) {
+            if (gpu_resize(c, *cur, st.out_w, st.out_h, *alt) != AJI_OK) { if (errmsg) *errmsg = c->err; return AJI_ERR; }
+            std::swap(cur, alt);
+        } else {
+            MgxModel* nm = c->models[st.model_idx].get();
+            const int IW = cur->w, IH = cur->h;
+            const size_t n = (size_t)3 * IW * IH;
+            half_t* ib = c->scratch.mdl_in.get(n);
+            if (!ib) { if (errmsg) *errmsg = "pinned host alloc failed (in)"; return AJI_ERR; }
+            const float* cb = cur->buf.data();
+            #pragma omp parallel for schedule(static) num_threads(color_nt(c, (long)n))
+            for (long i = 0; i < (long)n; i++) ib[i] = (half_t)cb[i];
+            try {
+                migraphx::program_parameters pp;
+                for (auto& p : nm->params) {
+                    if (p.is_input) {
+                        if (hipMemcpy(p.dev, ib, p.bytes, hipMemcpyHostToDevice) != hipSuccess) {
+                            if (errmsg) *errmsg = "hipMemcpy H2D failed"; return AJI_ERR;
+                        }
+                    }
+                    migraphx::shape sh(migraphx_shape_half_type, p.dims);
+                    pp.add(p.name.c_str(), migraphx::argument(sh, p.dev));
+                }
+                auto _ge = std::chrono::steady_clock::now();
+                auto outs = nm->prog.eval(pp);   // run the inference graph (MIGraphX API, not code-eval)
+                hipDeviceSynchronize();           // eval is async on the GPU stream; wait before D2H
+                if (getenv("AJI_ROCM_TIMING")) { static double te=0; static long ne=0;
+                    te += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_ge).count();
+                    if (++ne % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/eval] eval+sync=%.1fms\n", te/ne); }
+                auto osh = outs[0].get_shape().lengths();
+                if (osh.size() < 4) { if (errmsg) *errmsg = "bad output rank"; return AJI_ERR_SHAPE; }
+                const int OW = (int)osh[3], OH = (int)osh[2];
+                half_t* od = c->scratch.mdl_out.get((size_t)3 * OW * OH);
+                if (!od) { if (errmsg) *errmsg = "pinned host alloc failed (out)"; return AJI_ERR; }
+                if (hipMemcpy(od, outs[0].data(), nm->out_bytes, hipMemcpyDeviceToHost) != hipSuccess) {
+                    if (errmsg) *errmsg = "hipMemcpy D2H failed"; return AJI_ERR;
+                }
+                alt->create(OW, OH, 3);
+                float* ob = alt->buf.data(); const long on = (long)3 * OW * OH;
+                #pragma omp parallel for schedule(static) num_threads(color_nt(c, on))
+                for (long i = 0; i < on; i++) ob[i] = (float)od[i];
+                std::swap(cur, alt);
+            } catch (const std::exception& e) {
+                if (errmsg) *errmsg = std::string("infer eval failed: ") + e.what(); return AJI_ERR;
+            }
+        }
+    }
+    if (cur->w != c->out_w || cur->h != c->out_h || cur->c < 3) { if (errmsg) *errmsg = "unexpected output dims"; return AJI_ERR_SHAPE; }
+    std::swap(rgb_out.buf, cur->buf);           // O(1) hand-off (cur is scratch; keeps an allocation)
+    rgb_out.w = cur->w; rgb_out.h = cur->h; rgb_out.c = cur->c;
+    return AJI_OK;
+}
+
+// Allocate + upload the device-side out-color state (weights, scratch, output planes) for
+// one (W,H,format,matrix,range). Reused across frames; rebuilt if the stream changes. The
+// spline36 weights are resample.h's, computed on the host -> the GPU color matches gpu_post.
+static bool gpu_color_ensure(aji_ctx* c, int W, int H, int fmt, int mat, int rng) {
+    GpuColor& gc = c->gc;
+    if (gc.ready && gc.W == W && gc.H == H && gc.fmt == fmt && gc.mat == mat && gc.rng == rng) return true;
+    gc.free();
+    const int cw = W >> 1, ch = H >> 1;
+    aji_csp csp = aji_resample::make_csp(fmt, mat, rng);
+    gc.csp.kr = csp.kr; gc.csp.kb = csp.kb;
+    gc.csp.yscale = csp.yscale; gc.csp.yoff = csp.yoff;
+    gc.csp.cscale = csp.cscale; gc.csp.coff = csp.coff;
+    gc.csp.is_p010 = (fmt == AJI_FMT_P010) ? 1 : 0;
+    gc.csp.qdiv = gc.csp.is_p010 ? 64.0f : 1.0f;
+    gc.csp.qmax = gc.csp.is_p010 ? 1023.0f : 255.0f;
+    double sx, sy; aji_resample::chroma_shifts(AJI_SITING_LEFT, false, &sx, &sy);  // FORCE LEFT, like gpu_post
+    weights ph = aji_resample::compute(W, cw, sx, AJI_FILTER_SPLINE36);
+    weights pv = aji_resample::compute(H, ch, sy, AJI_FILTER_SPLINE36);
+    gc.ph_taps = ph.taps; gc.pv_taps = pv.taps;
+    bool ok = true;
+    auto up_i = [&](int*& d, const std::vector<int>& v) {
+        ok = ok && hipMalloc(&d, v.size()*sizeof(int)) == hipSuccess
+                && hipMemcpy(d, v.data(), v.size()*sizeof(int), hipMemcpyHostToDevice) == hipSuccess; };
+    auto up_f = [&](float*& d, const std::vector<float>& v) {
+        ok = ok && hipMalloc(&d, v.size()*sizeof(float)) == hipSuccess
+                && hipMemcpy(d, v.data(), v.size()*sizeof(float), hipMemcpyHostToDevice) == hipSuccess; };
+    up_i(gc.ph_start, ph.start); up_f(gc.ph_wt, ph.wt);
+    up_i(gc.pv_start, pv.start); up_f(gc.pv_wt, pv.wt);
+    const int bytes = gc.csp.is_p010 ? 2 : 1;
+    ok = ok && hipMalloc(&gc.Un, (size_t)W*H*sizeof(float)) == hipSuccess;
+    ok = ok && hipMalloc(&gc.Vn, (size_t)W*H*sizeof(float)) == hipSuccess;
+    ok = ok && hipMalloc(&gc.hu, (size_t)cw*H*sizeof(float)) == hipSuccess;
+    ok = ok && hipMalloc(&gc.hv, (size_t)cw*H*sizeof(float)) == hipSuccess;
+    ok = ok && hipMalloc(&gc.yplane, (size_t)W*H*bytes) == hipSuccess;
+    ok = ok && hipMalloc(&gc.uvplane, (size_t)cw*ch*2*bytes) == hipSuccess;
+    if (!ok) { gc.free(); return false; }
+    gc.W = W; gc.H = H; gc.fmt = fmt; gc.mat = mat; gc.rng = rng; gc.ready = true;
+    return true;
+}
+
+// GPU-resident path for a single-model no-resize chain: CPU-colored RGB input -> model ->
+// GPU out-color (RGB fp16 device -> NV12/P010 device) -> small YUV D2H into `out`. The 4K
+// RGB output never crosses PCIe and the fp16->fp32 cast + CPU gpu_post are gone. Runs on
+// the worker thread (the model output device buffer is consumed before the next eval).
+static int run_chain_gpu(aji_ctx* c, RgbMat& rgb_in, const aji_frame* out,
+                         int ofmt, int omat, int orng, std::string* errmsg) {
+    MgxModel* nm = c->models[0].get();
+    const int IW = rgb_in.w, IH = rgb_in.h;
+    const size_t n = (size_t)3 * IW * IH;
+    half_t* ib = c->scratch.mdl_in.get(n);
+    if (!ib) { if (errmsg) *errmsg = "pinned host alloc failed (in)"; return AJI_ERR; }
+    const float* cb = rgb_in.buf.data();
+    #pragma omp parallel for schedule(static) num_threads(color_nt(c, (long)n))
+    for (long i = 0; i < (long)n; i++) ib[i] = (half_t)cb[i];
+    try {
+        migraphx::program_parameters pp;
+        for (auto& p : nm->params) {
+            if (p.is_input) {
+                if (hipMemcpy(p.dev, ib, p.bytes, hipMemcpyHostToDevice) != hipSuccess) { if (errmsg) *errmsg = "hipMemcpy H2D failed"; return AJI_ERR; }
+            }
+            migraphx::shape sh(migraphx_shape_half_type, p.dims);
+            pp.add(p.name.c_str(), migraphx::argument(sh, p.dev));
+        }
+        auto _ge = std::chrono::steady_clock::now();
+        auto outs = nm->prog.eval(pp);   // inference graph (MIGraphX), not code-eval
+        if (hipDeviceSynchronize() != hipSuccess) { if (errmsg) *errmsg = "eval sync failed"; return AJI_ERR; }
+        if (getenv("AJI_ROCM_TIMING")) { static double te=0; static long ne=0;
+            te += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_ge).count();
+            if (++ne % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/eval] eval+sync=%.1fms\n", te/ne); }
+        auto oshape = outs[0].get_shape();
+        auto osh = oshape.lengths();
+        if (osh.size() < 4) { if (errmsg) *errmsg = "bad output rank"; return AJI_ERR_SHAPE; }
+        const int OW = (int)osh[3], OH = (int)osh[2];
+        if (OW != c->out_w || OH != c->out_h) { if (errmsg) *errmsg = "gpu-color out dims mismatch"; return AJI_ERR_SHAPE; }
+        if (getenv("AJI_ROCM_GPU_COLOR_DEBUG")) {
+            static bool once = false;
+            if (!once) { once = true;
+                auto st = oshape.strides();
+                fprintf(stderr, "[gpucolor] out lengths={%zu,%zu,%zu,%zu} strides={",
+                        osh[0],osh[1],osh[2],osh[3]);
+                for (auto s : st) fprintf(stderr, "%zu,", s);
+                fprintf(stderr, "} bytes=%zu  packedWHx3=%zu\n", oshape.bytes(), (size_t)3*OW*OH*2);
+            }
+        }
+        if (!gpu_color_ensure(c, OW, OH, ofmt, omat, orng)) { if (errmsg) *errmsg = "gpu color setup failed"; return AJI_ERR; }
+        GpuColor& gc = c->gc;
+        if (const char* dp = getenv("AJI_ROCM_DUMP")) {   // debug: dump model in/out fp16 to isolate non-determinism
+            std::string pin = std::string(dp) + ".in", pout = std::string(dp) + ".out";
+            FILE* fi = fopen(pin.c_str(), "wb"); if (fi) { fwrite(ib, sizeof(half_t), n, fi); fclose(fi); }
+            std::vector<half_t> ob((size_t)3 * OW * OH);
+            hipMemcpy(ob.data(), outs[0].data(), ob.size() * sizeof(half_t), hipMemcpyDeviceToHost);
+            FILE* fo = fopen(pout.c_str(), "wb"); if (fo) { fwrite(ob.data(), sizeof(half_t), ob.size(), fo); fclose(fo); }
+        }
+        auto _gc = std::chrono::steady_clock::now();
+        aji_gpu_out_color(outs[0].data(), OW, OH, gc.csp,
+            gc.ph_start, gc.ph_wt, gc.ph_taps, gc.pv_start, gc.pv_wt, gc.pv_taps,
+            gc.Un, gc.Vn, gc.hu, gc.hv, gc.yplane, gc.uvplane, nullptr);
+        if (hipDeviceSynchronize() != hipSuccess) { if (errmsg) *errmsg = "gpu out-color failed"; return AJI_ERR; }
+        const int cw = OW >> 1, ch = OH >> 1;
+        const int bytes = gc.csp.is_p010 ? 2 : 1;
+        ptrdiff_t ys  = out->stride[0] ? out->stride[0] : (ptrdiff_t)OW * bytes;
+        ptrdiff_t uvs = out->stride[1] ? out->stride[1] : (ptrdiff_t)cw * 2 * bytes;
+        if (hipMemcpy2D(out->plane[0], ys, gc.yplane, (size_t)OW*bytes, (size_t)OW*bytes, OH, hipMemcpyDeviceToHost) != hipSuccess) { if (errmsg) *errmsg = "D2H Y failed"; return AJI_ERR; }
+        if (hipMemcpy2D(out->plane[1], uvs, gc.uvplane, (size_t)cw*2*bytes, (size_t)cw*2*bytes, ch, hipMemcpyDeviceToHost) != hipSuccess) { if (errmsg) *errmsg = "D2H UV failed"; return AJI_ERR; }
+        if (getenv("AJI_ROCM_TIMING")) { static double tg=0; static long ng=0;
+            tg += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_gc).count();
+            if (++ng % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/gpucolor] out-color+D2H=%.1fms\n", tg/ng); }
+    } catch (const std::exception& e) {
+        if (errmsg) *errmsg = std::string("gpu chain failed: ") + e.what(); return AJI_ERR;
+    }
+    return AJI_OK;
+}
+
+// The worker: pull submitted slots in order, run their chain on the GPU, mark DONE.
+static void infer_worker_loop(aji_ctx* c) {
+    for (;;) {
+        int idx;
+        {
+            std::unique_lock<std::mutex> lk(c->infer_mtx);
+            c->infer_cv_worker.wait(lk, [c]{ return c->infer_stop || !c->infer_pending.empty(); });
+            if (c->infer_stop && c->infer_pending.empty()) return;
+            idx = c->infer_pending.front();
+            c->infer_pending.pop_front();
+        }
+        std::string em;
+        int e;
+        bool gpu_colored = false;
+        if (c->gpu_color_eligible) {
+            aji_ctx::InferSlot& s = c->slots[idx];
+            e = run_chain_gpu(c, s.rgb_in, &s.out, s.ofmt, s.omat, s.orng, &em);
+            gpu_colored = (e == AJI_OK);   // worker already wrote out; wait skips gpu_post
+        } else {
+            e = run_chain(c, c->slots[idx].rgb_in, c->slots[idx].rgb_out, &em);
+        }
+        {
+            std::lock_guard<std::mutex> lk(c->infer_mtx);
+            c->slots[idx].err = e;
+            c->slots[idx].errmsg = std::move(em);
+            c->slots[idx].gpu_colored = gpu_colored;
+            c->slots[idx].state = aji_ctx::SLOT_DONE;
+        }
+        c->infer_cv_main.notify_all();
+    }
+}
+
+static void infer_worker_start(aji_ctx* c) {
+    if (c->infer_worker_started) return;
+    c->infer_stop = false;
+    c->infer_worker = std::thread(infer_worker_loop, c);
+    c->infer_worker_started = true;
+}
+
+static void infer_worker_stop(aji_ctx* c) {
+    if (!c->infer_worker_started) return;
+    { std::lock_guard<std::mutex> lk(c->infer_mtx); c->infer_stop = true; }
+    c->infer_cv_worker.notify_all();
+    if (c->infer_worker.joinable()) c->infer_worker.join();
+    c->infer_worker_started = false;
 }
 
 extern "C" {
@@ -497,6 +905,7 @@ AJI_EXPORT aji_ctx* aji_create(const aji_create_params* p) {
     aji_ctx* c = new aji_ctx();
     c->logfn = p->log;
     c->log_opaque = p->log_opaque;
+    c->async_build = p->async_build != 0;  // filter sets 1: compile off-thread, show OSD
 #ifdef _OPENMP
     c->nthreads = std::max(1, std::min(8, omp_get_max_threads()));
     c->nthreads_max = std::max(1, omp_get_max_threads());
@@ -528,6 +937,9 @@ AJI_EXPORT int aji_set_slot(aji_ctx* c, int slot) { if (c) c->slot = slot; retur
 
 AJI_EXPORT int aji_configure(aji_ctx* c, int w, int h, double fps, int* out_w, int* out_h) {
     if (!c) return AJI_ERR;
+    // The filter drains in-flight frames before reconfiguring, but stop the worker anyway
+    // so build_plan can clear/rebuild the model list with no chance of a concurrent chain.
+    infer_worker_stop(c);
     int r = build_plan(c, w, h, fps);
     if (r < 0) { return r; }
     if (out_w) *out_w = c->out_w;
@@ -553,16 +965,31 @@ AJI_EXPORT int aji_infer(aji_ctx* c, const aji_frame* in, const aji_frame* out, 
     if (format != AJI_FMT_NV12 && format != AJI_FMT_P010) { c->err = "aji_infer: unsupported input format"; return AJI_ERR_FORMAT; }
     if (out_format != AJI_FMT_NV12 && out_format != AJI_FMT_P010) { c->err = "aji_infer: unsupported output format"; return AJI_ERR_FORMAT; }
 
-    // TEMP: env-gated per-stage timing (AJI_ROCM_TIMING=1).
     static const bool kT = getenv("AJI_ROCM_TIMING") != nullptr;
-    static double tPre=0, tModel=0, tPost=0; static long tN=0;
     auto _now = []{ return std::chrono::steady_clock::now(); };
     auto _ms  = [](auto a, auto b){ return std::chrono::duration<double,std::milli>(b-a).count(); };
-    auto _t0 = _now();
 
-    // Color is done on CPU (resample.h, bit-exact reference) — no GPU color init
-    // needed. (The GLSL kernels in color_init are kept for the future P4
-    // GPU-resident path but are not on the critical path and corrupt at scale.)
+    // SUBMIT (filter thread): claim a free in-flight slot (back-pressure if all are busy),
+    // do CPU in-color into it, then hand it to the worker thread. The worker runs the GPU
+    // model chain while this thread returns to color the next frame; aji_wait() collects the
+    // result with CPU out-color. Color stays on CPU (resample.h, bit-exact reference); the
+    // overlap is what raises 4K fps, not GPU color (that is the later P4 phase B).
+    infer_worker_start(c);
+    int slot_idx = -1;
+    {
+        std::unique_lock<std::mutex> lk(c->infer_mtx);
+        c->infer_cv_main.wait(lk, [c, &slot_idx]{
+            for (int i = 0; i < aji_ctx::kRing; i++)
+                if (c->slots[i].state == aji_ctx::SLOT_FREE) { slot_idx = i; return true; }
+            return false;
+        });
+        aji_ctx::InferSlot& sl = c->slots[slot_idx];
+        sl.ticket = ++c->infer_last_ticket;
+        sl.err = AJI_OK; sl.errmsg.clear();
+        sl.state = aji_ctx::SLOT_SUBMITTED;   // reserved; not yet in the worker queue
+    }
+    aji_ctx::InferSlot& slot = c->slots[slot_idx];
+    auto _t0 = _now();
 
     // ---- read host YUV planes into fp32 raw-container values ----
     std::vector<float>& Yf = c->scratch.Yf; Yf.resize((size_t)W * H);
@@ -594,97 +1021,109 @@ AJI_EXPORT int aji_infer(aji_ctx* c, const aji_frame* in, const aji_frame* out, 
         }
     }
 
-    // ---- CPU pre: YUV -> RGB fp32 NCHW (into a pooled ping-pong buffer) ----
-    RgbMat* cur = &c->scratch.rgbA;
-    RgbMat* alt = &c->scratch.rgbB;
-    if (gpu_pre(c, W, H, format, matrix, range, siting, Yf, Uf, Vf, *cur) != AJI_OK) {
+    // ---- CPU in-color into the slot's input buffer ----
+    if (gpu_pre(c, W, H, format, matrix, range, siting, Yf, Uf, Vf, slot.rgb_in) != AJI_OK) {
+        { std::lock_guard<std::mutex> lk(c->infer_mtx); slot.state = aji_ctx::SLOT_FREE; slot.ticket = 0; }
+        c->infer_cv_main.notify_all();
         logmsg(c, 2, c->err.c_str()); return AJI_ERR;
     }
-    auto _t1 = _now();   // end of input color
+    if (kT) { static double tp=0; static long np=0; tp += _ms(_t0, _now());
+        if (++np % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/pre] in-color=%.1fms\n", tp/np); }
 
-    // ---- model chain + resize steps (RGB fp32 NCHW; ping-pong the two pooled buffers
-    // so nothing reallocates per frame) ----
-    for (const Step& st : c->steps) {
-        if (st.kind == Step::RESIZE) {
-            if (gpu_resize(c, *cur, st.out_w, st.out_h, *alt) != AJI_OK) { logmsg(c, 2, c->err.c_str()); return AJI_ERR; }
-            std::swap(cur, alt);
-        } else {
-            MgxModel* nm = c->models[st.model_idx].get();
-            const int IW = cur->w, IH = cur->h;
-            const size_t n = (size_t)3 * IW * IH;
-            // fp32 RGB NCHW -> fp16 (the model input dtype); pinned + -mf16c vectorized.
-            half_t* ib = c->scratch.mdl_in.get(n);
-            if (!ib) { c->err = "pinned host alloc failed (in)"; return AJI_ERR; }
-            const float* cb = cur->buf.data();
-            #pragma omp parallel for schedule(static) num_threads(color_nt(c, (long)n))
-            for (long i = 0; i < (long)n; i++) ib[i] = (half_t)cb[i];
-
-            // Device-resident eval: copy fp16 input to its persistent device buffer, bind
-            // every param's device buffer, run (writes into main:#output_0), copy back.
-            try {
-                migraphx::program_parameters pp;
-                for (auto& p : nm->params) {
-                    if (p.is_input) {
-                        if (hipMemcpy(p.dev, ib, p.bytes, hipMemcpyHostToDevice) != hipSuccess) {
-                            c->err = "hipMemcpy H2D failed"; return AJI_ERR;
-                        }
-                    }
-                    migraphx::shape sh(migraphx_shape_half_type, p.dims);
-                    pp.add(p.name.c_str(), migraphx::argument(sh, p.dev));
-                }
-                auto _ge = std::chrono::steady_clock::now();
-                auto outs = nm->prog.eval(pp);
-                hipDeviceSynchronize();   // eval is async on the GPU stream; wait before D2H
-                if (getenv("AJI_ROCM_TIMING")) { static double te=0; static long ne=0;
-                    te += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_ge).count();
-                    if (++ne % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/eval] eval+sync=%.1fms\n", te/ne); }
-                auto osh = outs[0].get_shape().lengths();   // {1,3,OH,OW}
-                if (osh.size() < 4) { c->err = "infer: bad output rank"; return AJI_ERR_SHAPE; }
-                const int OW = (int)osh[3], OH = (int)osh[2];
-                half_t* od = c->scratch.mdl_out.get((size_t)3 * OW * OH);
-                if (!od) { c->err = "pinned host alloc failed (out)"; return AJI_ERR; }
-                if (hipMemcpy(od, outs[0].data(), nm->out_bytes, hipMemcpyDeviceToHost) != hipSuccess) {
-                    c->err = "hipMemcpy D2H failed"; return AJI_ERR;
-                }
-                alt->create(OW, OH, 3);
-                float* ob = alt->buf.data(); const long on = (long)3 * OW * OH;
-                #pragma omp parallel for schedule(static) num_threads(color_nt(c, on))
-                for (long i = 0; i < on; i++) ob[i] = (float)od[i];
-                std::swap(cur, alt);
-            } catch (const std::exception& e) {
-                c->err = std::string("infer eval failed: ") + e.what(); return AJI_ERR;
-            }
-        }
+    // ---- hand the slot to the worker; its GPU chain overlaps the next frame's color ----
+    slot.out = *out; slot.ofmt = out_format; slot.omat = out_matrix; slot.orng = out_range;
+    {
+        std::lock_guard<std::mutex> lk(c->infer_mtx);
+        c->infer_pending.push_back(slot_idx);
     }
-    if (cur->w != c->out_w || cur->h != c->out_h || cur->c < 3) { c->err = "infer: unexpected output dims"; return AJI_ERR_SHAPE; }
-    auto _t2 = _now();   // end of model chain
-
-    // ---- CPU post: RGB fp32 NCHW -> host YUV ----
-    if (gpu_post(c, *cur, out_format, out_matrix, out_range, out) != AJI_OK) {
-        logmsg(c, 2, c->err.c_str()); return AJI_ERR;
-    }
-    if (kT) {
-        tPre += _ms(_t0,_t1); tModel += _ms(_t1,_t2); tPost += _ms(_t2,_now()); tN++;
-        if (tN % 50 == 0) {
-            double tot = tPre+tModel+tPost;
-            fprintf(stderr, "[AJI_ROCM_TIMING] n=%ld  in-color=%.1fms (%.0f%%)  "
-                "model=%.1fms (%.0f%%)  out-color=%.1fms (%.0f%%)  total=%.1fms => %.1f fps\n",
-                tN, tPre/tN, 100*tPre/tot, tModel/tN, 100*tModel/tot, tPost/tN, 100*tPost/tot,
-                tot/tN, 1000.0/(tot/tN));
-        }
-    }
+    c->infer_cv_worker.notify_one();
     return AJI_OK;
 }
 
-AJI_EXPORT uint64_t aji_flush(aji_ctx*, void*) { return 1; }
-AJI_EXPORT int aji_done(aji_ctx*, uint64_t) { return 1; }
-AJI_EXPORT int aji_wait(aji_ctx*, uint64_t) { return AJI_OK; }
+// Async completion (aji_flush/done/wait). The filter submits up to `depth` frames, then
+// collects them in submission order. flush returns the last-submitted ticket; done is a
+// non-blocking check; wait blocks for the worker's GPU chain, then does CPU out-color —
+// which overlaps the worker's NEXT eval, the win this whole path exists for.
+AJI_EXPORT uint64_t aji_flush(aji_ctx* c, void* /*stream*/) {
+    if (!c) return 0;
+    std::lock_guard<std::mutex> lk(c->infer_mtx);
+    return c->infer_last_ticket;
+}
+
+AJI_EXPORT int aji_done(aji_ctx* c, uint64_t ticket) {
+    if (!c || ticket == 0) return 1;
+    std::lock_guard<std::mutex> lk(c->infer_mtx);
+    for (int i = 0; i < aji_ctx::kRing; i++)
+        if (c->slots[i].ticket == ticket) return c->slots[i].state == aji_ctx::SLOT_DONE ? 1 : 0;
+    return 1;   // unknown ticket: already collected
+}
+
+AJI_EXPORT int aji_wait(aji_ctx* c, uint64_t ticket) {
+    if (!c || ticket == 0) return AJI_OK;
+    static const bool kT = getenv("AJI_ROCM_TIMING") != nullptr;
+    int idx = -1;
+    {
+        std::unique_lock<std::mutex> lk(c->infer_mtx);
+        c->infer_cv_main.wait(lk, [c, ticket, &idx]{
+            for (int i = 0; i < aji_ctx::kRing; i++)
+                if (c->slots[i].ticket == ticket) {
+                    if (c->slots[i].state == aji_ctx::SLOT_DONE) { idx = i; return true; }
+                    return false;   // still in flight -> keep waiting
+                }
+            idx = -1; return true;  // ticket not present: already collected
+        });
+    }
+    if (idx < 0) return AJI_OK;
+    aji_ctx::InferSlot& s = c->slots[idx];
+    int rc = AJI_OK;
+    if (s.err != AJI_OK) { c->err = s.errmsg; logmsg(c, 2, c->err.c_str()); rc = s.err; }
+    else if (s.gpu_colored) {
+        // the worker did GPU out-color + D2H straight into s.out — nothing to do here
+    }
+    else {
+        auto _t = std::chrono::steady_clock::now();
+        if (gpu_post(c, s.rgb_out, s.ofmt, s.omat, s.orng, &s.out) != AJI_OK) {
+            logmsg(c, 2, c->err.c_str()); rc = AJI_ERR;
+        } else if (kT) { static double tq=0; static long nq=0;
+            tq += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_t).count();
+            if (++nq % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/post] out-color=%.1fms\n", tq/nq); }
+    }
+    {
+        std::lock_guard<std::mutex> lk(c->infer_mtx);
+        s.state = aji_ctx::SLOT_FREE; s.ticket = 0;
+        // Also free any still-occupied slot with an EARLIER ticket. The filter drains the
+        // pipeline on seek/flush (drain_ring) by waiting only the NEWEST ticket — tickets
+        // complete in submission order, so that covers all GPU work, but our slots are freed
+        // per aji_wait. Without this the un-waited older slots leak, and after a few seeks all
+        // kRing slots are gone so aji_infer blocks forever for a free slot (the seek deadlock).
+        // The FIFO worker finished every lower-ticket frame before this one, so they are done.
+        for (int i = 0; i < aji_ctx::kRing; i++)
+            if (c->slots[i].ticket != 0 && c->slots[i].ticket < ticket) {
+                c->slots[i].state = aji_ctx::SLOT_FREE;
+                c->slots[i].ticket = 0;
+            }
+    }
+    c->infer_cv_main.notify_all();
+    return rc;
+}
 
 AJI_EXPORT const char* aji_current_log(aji_ctx* c) { return c ? c->log.c_str() : ""; }
 AJI_EXPORT int aji_scale_factor(aji_ctx* c) { return c ? c->chain_scale : 0; }
 AJI_EXPORT int aji_rife_factor(aji_ctx*, int*, int*) { return 0; }
 AJI_EXPORT int aji_rife_before_upscale(aji_ctx*) { return 1; }  // moot: aji_rocm has no RIFE
-AJI_EXPORT int aji_poll(aji_ctx*) { return 0; }
+// Returns 1 exactly once when a background engine compile has finished (success or
+// failure); the filter then re-runs aji_configure, which finds the now-cached engine
+// (or, on failure, the failed-set marker -> passthrough). 0 if no build, still running,
+// or already reported.
+AJI_EXPORT int aji_poll(aji_ctx* c) {
+    if (!c || !c->build) return 0;
+    if (c->build->done.load() != 1) return 0;            // no build finished
+    if (c->build->reported.exchange(true)) return 0;     // already told the caller once
+    if (c->build_thread.joinable()) c->build_thread.join();  // reap the finished worker
+    if (!c->build->ok.load())
+        c->failed_builds.insert(c->build->key);          // don't re-kick a failing build
+    return 1;
+}
 
 AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame*, const aji_frame*, double,
                               const aji_frame*, void*) {
@@ -695,7 +1134,16 @@ AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame*, const aji_frame*, do
 AJI_EXPORT const char* aji_last_error(aji_ctx* c) { return c ? c->err.c_str() : "null ctx"; }
 
 AJI_EXPORT void aji_destroy(aji_ctx** c) {
-    if (c && *c) { delete *c; *c = nullptr; }
+    if (c && *c) {
+        infer_worker_stop(*c);   // drain + join the inference worker
+        (*c)->gc.free();         // free GPU out-color device buffers
+        // A compile may still be running (player quit mid-build). The worker holds its
+        // own shared_ptr to the BuildState and never touches the ctx, so detaching is
+        // safe — no use-after-free, and aji_destroy doesn't hang for ~140s. The temp-then-
+        // rename save means an abandoned compile leaves no half-written .mxr.
+        if ((*c)->build_thread.joinable()) (*c)->build_thread.detach();
+        delete *c; *c = nullptr;
+    }
 }
 
 } // extern "C"

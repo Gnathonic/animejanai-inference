@@ -166,12 +166,19 @@ find_library(AJI_MIGRAPHX_LIB NAMES migraphx_c PATHS "${AJI_ROCM_ROOT}/lib")
 find_library(AJI_HIP_LIB NAMES amdhip64 PATHS "${AJI_ROCM_ROOT}/lib")
 find_package(OpenMP)
 if(AJI_MIGRAPHX_LIB AND AJI_HIP_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraphx/migraphx.hpp")
-    add_library(aji_rocm SHARED src/aji_rocm.cpp src/aji_conf.cpp)
+    # GPU-resident color (Phase B): aji_rocm_color.hip holds the YUV<->RGB + chroma
+    # resample kernels (hipcc); the .cpp stays CXX (g++). gfx1201 = RDNA4 (RX 9070 XT).
+    if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
+        set(CMAKE_HIP_ARCHITECTURES gfx1201)
+    endif()
+    enable_language(HIP)
+    add_library(aji_rocm SHARED src/aji_rocm.cpp src/aji_rocm_color.hip src/aji_conf.cpp)
     target_include_directories(aji_rocm
         PUBLIC include
         PRIVATE src "${AJI_ROCM_ROOT}/include")
     # -mf16c/-mavx2 so the per-frame fp32<->fp16 RGB casts vectorize (vcvtps2ph/ph2ps).
-    target_compile_options(aji_rocm PRIVATE -mf16c -mavx2 -mfma)
+    # Scope to CXX so they aren't passed to hipcc (clang) for the .hip source.
+    target_compile_options(aji_rocm PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mf16c -mavx2 -mfma>)
     target_compile_definitions(aji_rocm PRIVATE __HIP_PLATFORM_AMD__)
     target_link_libraries(aji_rocm PRIVATE ${AJI_MIGRAPHX_LIB} ${AJI_HIP_LIB})
     if(OpenMP_CXX_FOUND)
