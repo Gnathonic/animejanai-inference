@@ -264,14 +264,17 @@ static int round_even(double x) {
 // onto the GPU (P4), not more CPU threads.
 static inline int color_nt(const aji_ctx* c, long /*npix*/) { return c->nthreads; }
 
-// The cache file for one engine: <onnx>.<W>x<H>.dev.mlir.fp16.mxr next to the model. The
-// ".mlir" tag invalidates the older MLIR-disabled engines, which had a non-deterministic
-// MIOpen-fallback conv artifact (evenly-spaced column static) at 4K.
-static std::string mxr_cache_path(const std::string& onnx, int w, int h) {
-    return onnx + "." + std::to_string(w) + "x" + std::to_string(h) + ".dev.mlir.fp16.mxr";
+// The cache file for one engine: <onnx>.<W>x<H>.c<channels>.dev.mlir.fp16.mxr next to the
+// model. The channel count is folded into the key so an 11-ch RIFE engine at the same
+// resolution can't collide with a 3-ch upscaler engine. The ".mlir" tag invalidates the
+// older MLIR-disabled engines, which had a non-deterministic MIOpen-fallback conv artifact
+// (evenly-spaced column static) at 4K.
+static std::string mxr_cache_path(const std::string& onnx, int w, int h, int channels = 3) {
+    return onnx + "." + std::to_string(w) + "x" + std::to_string(h)
+           + ".c" + std::to_string(channels) + ".dev.mlir.fp16.mxr";
 }
-static bool mxr_cached(const std::string& onnx, int w, int h) {
-    std::ifstream probe(mxr_cache_path(onnx, w, h), std::ios::binary);
+static bool mxr_cached(const std::string& onnx, int w, int h, int channels = 3) {
+    std::ifstream probe(mxr_cache_path(onnx, w, h, channels), std::ios::binary);
     return probe.good();
 }
 
@@ -280,7 +283,8 @@ static bool mxr_cached(const std::string& onnx, int w, int h) {
 // temp file then atomically renames into place, so an interrupted compile (player quit
 // mid-build) never leaves a half-written .mxr that would later fail to load.
 // Returns false + *errout on error.
-static bool compile_mxr(const std::string& onnx_path, int in_w, int in_h, std::string* errout) {
+static bool compile_mxr(const std::string& onnx_path, int in_w, int in_h, std::string* errout,
+                        int in_channels = 3) {
     try {
         // MLIR (rocMLIR) is the DEFAULT conv codegen on RDNA and is REQUIRED for correctness:
         // disabling it falls back to a MIOpen conv solver that reads uninitialized workspace at
@@ -291,12 +295,12 @@ static bool compile_mxr(const std::string& onnx_path, int in_w, int in_h, std::s
         // experiments. (Dynamic-shape compile is still impossible: the SPAN reflect-pad preamble
         // has non-constant pads MIGraphX can't parse dynamically.)
         migraphx::onnx_options oo;
-        oo.set_input_parameter_shape("input", {1, 3, (size_t)in_h, (size_t)in_w});
+        oo.set_input_parameter_shape("input", {1, (size_t)in_channels, (size_t)in_h, (size_t)in_w});
         auto prog = migraphx::parse_onnx(onnx_path.c_str(), oo);
         migraphx::quantize_fp16(prog);
         migraphx::compile_options co; co.set_offload_copy(false);  // device-resident
         prog.compile(migraphx::target("gpu"), co);
-        const std::string cache = mxr_cache_path(onnx_path, in_w, in_h);
+        const std::string cache = mxr_cache_path(onnx_path, in_w, in_h, in_channels);
         const std::string tmp = cache + ".tmp." + std::to_string(in_w) + "x" + std::to_string(in_h);
         migraphx::save(prog, tmp.c_str());
         if (std::rename(tmp.c_str(), cache.c_str()) != 0) {
@@ -331,18 +335,20 @@ static void start_async_build(aji_ctx* c, const std::string& onnx, int w, int h)
 // already be on disk (the async path defers an uncached model before reaching here; the
 // sync path compiles it inline first). MIGraphX builds a static per-shape engine, so a
 // model used at several resolutions in a chain gets one engine per resolution.
+// in_channels == 11 selects the RIFE path: output is the 3-channel non-input 4D param,
+// scale is fixed at 1, and both shapes are hard-asserted.
 static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_path,
-                                            int in_w, int in_h) {
+                                            int in_w, int in_h, int in_channels = 3) {
     auto m = std::make_unique<MgxModel>();
     m->in_w = in_w; m->in_h = in_h;
-    m->in_name = "input";   // the SPAN dynamo export's input blob name
+    m->in_name = "input";   // the SPAN dynamo export's input blob name; same for RIFE
 
-    const std::string cache = mxr_cache_path(onnx_path, in_w, in_h);
+    const std::string cache = mxr_cache_path(onnx_path, in_w, in_h, in_channels);
     try {
-        if (!mxr_cached(onnx_path, in_w, in_h)) {
+        if (!mxr_cached(onnx_path, in_w, in_h, in_channels)) {
             // sync (CLI/benchmark) path: async_build defers before getting here
             std::string e;
-            if (!compile_mxr(onnx_path, in_w, in_h, &e)) { c->err = e; return nullptr; }
+            if (!compile_mxr(onnx_path, in_w, in_h, &e, in_channels)) { c->err = e; return nullptr; }
         }
         m->prog = migraphx::load(cache.c_str());
     } catch (const std::exception& e) {
@@ -351,7 +357,10 @@ static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_
     }
 
     // One device buffer per program parameter (input + main:#output_0 [+ scratch]),
-    // allocated once. The output is the 4D non-input param; scale = out_h / in_h.
+    // allocated once. For upscale (in_channels==3): the output is the last 4D non-input
+    // param; scale = out_h / in_h. For RIFE (in_channels==11): the output is the non-input
+    // 4D param whose second dimension is 3; shapes are hard-asserted.
+    const bool is_rife = (in_channels == 11);
     try {
         auto ps = m->prog.get_parameter_shapes();
         for (auto&& name : ps.names()) {
@@ -372,13 +381,50 @@ static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_
             hipMemset(p.dev, 0, p.bytes);
             if (getenv("AJI_ROCM_GPU_COLOR_DEBUG"))
                 fprintf(stderr, "[param] %s  bytes=%zu  is_input=%d\n", p.name.c_str(), p.bytes, (int)p.is_input);
-            if (!p.is_input && p.dims.size() == 4) {
-                m->out_h = (int)p.dims[2]; m->out_w = (int)p.dims[3]; m->out_bytes = p.bytes;
+            if (!is_rife) {
+                // Upscale path: last-wins 4D non-input param is the output.
+                if (!p.is_input && p.dims.size() == 4) {
+                    m->out_h = (int)p.dims[2]; m->out_w = (int)p.dims[3]; m->out_bytes = p.bytes;
+                }
+            } else {
+                // RIFE path: output is the non-input 4D param with dims[1]==3.
+                if (!p.is_input && p.dims.size() == 4 && p.dims[1] == 3) {
+                    m->out_h = (int)p.dims[2]; m->out_w = (int)p.dims[3]; m->out_bytes = p.bytes;
+                }
             }
             m->params.push_back(std::move(p));
         }
-        if (m->out_h <= 0 || m->out_h % in_h != 0) { c->err = "model output shape not a scale of input"; return nullptr; }
-        m->scale = m->out_h / in_h;
+
+        if (!is_rife) {
+            // Upscale: output must be an integer scale of the input.
+            if (m->out_h <= 0 || m->out_h % in_h != 0) { c->err = "model output shape not a scale of input"; return nullptr; }
+            m->scale = m->out_h / in_h;
+        } else {
+            // RIFE: assert input {1,11,in_h,in_w} and output {1,3,in_h,in_w}.
+            // Silently miscompiled dynamic-channel graphs abort at Concat, so fail loudly here.
+            bool input_ok = false, output_ok = false;
+            for (auto& p : m->params) {
+                if (p.is_input && p.dims.size() == 4 &&
+                    p.dims[0] == 1 && p.dims[1] == 11 &&
+                    p.dims[2] == (size_t)in_h && p.dims[3] == (size_t)in_w)
+                    input_ok = true;
+                if (!p.is_input && p.dims.size() == 4 &&
+                    p.dims[0] == 1 && p.dims[1] == 3 &&
+                    p.dims[2] == (size_t)in_h && p.dims[3] == (size_t)in_w)
+                    output_ok = true;
+            }
+            if (!input_ok) {
+                c->err = "RIFE engine: input param is not {1,11," + std::to_string(in_h)
+                         + "," + std::to_string(in_w) + "} — wrong model or shape";
+                return nullptr;
+            }
+            if (!output_ok) {
+                c->err = "RIFE engine: output param is not {1,3," + std::to_string(in_h)
+                         + "," + std::to_string(in_w) + "} — wrong model or shape";
+                return nullptr;
+            }
+            m->scale = 1;  // RIFE is temporal interpolation, not spatial upscale
+        }
     } catch (const std::exception& e) {
         c->err = "migraphx param setup failed: " + std::string(e.what());
         return nullptr;
