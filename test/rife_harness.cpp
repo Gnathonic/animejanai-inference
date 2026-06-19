@@ -277,7 +277,12 @@ int main(void) {
         if (mx > 254 && mn < 1) {
             // huge spread is acceptable; just guard against a wild garbage buffer
         }
-        printf("motion PASS (OUT written, valid Y range)\n");
+        double diff_a = mean_abs_diff_y(OUT, A);
+        double diff_b = mean_abs_diff_y(OUT, B);
+        printf("  motion: meanY=%.1f  |OUT-A|=%.3f  |OUT-B|=%.3f\n", m, diff_a, diff_b);
+        if (diff_a < 1.0) { aji_destroy(&c); return FAIL("motion OUT == A (passthrough?)"); }
+        if (diff_b < 1.0) { aji_destroy(&c); return FAIL("motion OUT == B (passthrough?)"); }
+        printf("motion PASS (OUT written, valid Y range, differs from both inputs)\n");
     }
 
     // -- scene cut: BLACK (Y=16) -> WHITE (Y=235) -> AJI_SCENE --
