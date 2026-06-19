@@ -317,14 +317,15 @@ static bool compile_mxr(const std::string& onnx_path, int in_w, int in_h, std::s
 // Kick a background compile of one engine; the configure that called this returns
 // passthrough and aji_poll() reports when to reconfigure. The worker captures only a
 // shared_ptr to the BuildState (never the ctx), so it outlives the ctx safely.
-static void start_async_build(aji_ctx* c, const std::string& onnx, int w, int h) {
+static void start_async_build(aji_ctx* c, const std::string& onnx, int w, int h,
+                              int in_channels = 3) {
     if (c->build_thread.joinable()) c->build_thread.join();  // reap a previous finished worker
     auto bs = std::make_shared<BuildState>();
-    bs->onnx = onnx; bs->key = mxr_cache_path(onnx, w, h); bs->w = w; bs->h = h;
+    bs->onnx = onnx; bs->key = mxr_cache_path(onnx, w, h, in_channels); bs->w = w; bs->h = h;
     c->build = bs;
-    c->build_thread = std::thread([bs]() {
+    c->build_thread = std::thread([bs, in_channels]() {
         std::string e;
-        bool ok = compile_mxr(bs->onnx, bs->w, bs->h, &e);
+        bool ok = compile_mxr(bs->onnx, bs->w, bs->h, &e, in_channels);
         bs->err = e;
         bs->ok.store(ok);
         bs->done.store(1);   // release: main reads ok/err only after seeing done==1
@@ -387,8 +388,10 @@ static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_
                     m->out_h = (int)p.dims[2]; m->out_w = (int)p.dims[3]; m->out_bytes = p.bytes;
                 }
             } else {
-                // RIFE path: output is the non-input 4D param with dims[1]==3.
-                if (!p.is_input && p.dims.size() == 4 && p.dims[1] == 3) {
+                // RIFE path: output is the FIRST non-input 4D param with dims[1]==3.
+                // Guard with out_h==0 so a later scratch param with the same channel
+                // count can't overwrite the real output latch.
+                if (!p.is_input && p.dims.size() == 4 && p.dims[1] == 3 && m->out_h == 0) {
                     m->out_h = (int)p.dims[2]; m->out_w = (int)p.dims[3]; m->out_bytes = p.bytes;
                 }
             }
@@ -618,10 +621,12 @@ static int gpu_post(aji_ctx* c, const RgbMat& rgb, int format, int matrix, int r
 // success the model is pushed into c->models and its scale (>0) returned. Returns -1 on a
 // hard load error. On defer/failure it sets a marker in c->log for engine_monitor.lua.
 // Returns: >0 scale (loaded), 0 deferred to a background build, -1 error.
+// in_channels defaults to 3 (upscale path); pass 11 for RIFE so the cache key and
+// compile both use the correct channel count.
 static int ensure_model(aji_ctx* c, const std::string& onnx, const std::string& name,
-                        int in_w, int in_h) {
-    if (c->async_build && !mxr_cached(onnx, in_w, in_h)) {
-        const std::string key = mxr_cache_path(onnx, in_w, in_h);
+                        int in_w, int in_h, int in_channels = 3) {
+    if (c->async_build && !mxr_cached(onnx, in_w, in_h, in_channels)) {
+        const std::string key = mxr_cache_path(onnx, in_w, in_h, in_channels);
         char res[32]; snprintf(res, sizeof res, "%dx%d", in_w, in_h);
         if (c->failed_builds.count(key)) {
             c->log = "MIGraphX engine build FAILED for " + name + " for " + res +
@@ -631,12 +636,12 @@ static int ensure_model(aji_ctx* c, const std::string& onnx, const std::string& 
         // One build at a time: a multi-engine chain cascades through repeated
         // poll() -> reconfigure cycles, building the next uncached engine each time.
         bool building = c->build && c->build->done.load() == 0;
-        if (!building) start_async_build(c, onnx, in_w, in_h);
+        if (!building) start_async_build(c, onnx, in_w, in_h, in_channels);
         c->log = "Building MIGraphX engine for " + name + " for " + res +
                  " (first play at this resolution)";
         return 0;
     }
-    auto m = load_model(c, onnx, in_w, in_h);
+    auto m = load_model(c, onnx, in_w, in_h, in_channels);
     if (!m) { logmsg(c, 2, c->err.c_str()); return -1; }
     int sc = m->scale;
     c->models.push_back(std::move(m));
