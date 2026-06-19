@@ -136,9 +136,12 @@ struct aji_ctx {
         RgbMat rgbA, rgbB;                              // ping-pong RGB buffers (reused per frame)
     } scratch;
 
-    // CPU-color OpenMP width. Capped: on small frames the per-region spawn/sync
-    // overhead of many threads outweighs the work (measured: 8 ~= peak, 32 < 1).
+    // CPU-color OpenMP width. nthreads is the small-frame cap (spawn/sync overhead of
+    // many threads outweighs the work on small frames: 8 ~= peak, 32 < 1); nthreads_max
+    // is the box's width, used for LARGE frames (4K post is ~8M px and scales well past
+    // 8 cores). color_nt() picks per-call by pixel count.
     int nthreads = 1;
+    int nthreads_max = 1;
 
     std::string err, log;
     aji_log_fn logfn = nullptr;
@@ -153,6 +156,13 @@ static int round_even(double x) {
     int r = (int)(x + 0.5);
     return r;
 }
+
+// OpenMP width for a CPU-color/cast pass. The resample/color is memory-bandwidth-bound,
+// so threads past ~8 just contend on the memory bus and SLOW it down (measured: scaling a
+// 4K post pass to 32 threads regressed wall fps 14->12). So the historical cap holds even
+// for 4K; nthreads_max is kept only for diagnostics. The real lever for color is moving it
+// onto the GPU (P4), not more CPU threads.
+static inline int color_nt(const aji_ctx* c, long /*npix*/) { return c->nthreads; }
 
 // Compile (or load a cached) MIGraphX fp16 engine for one .onnx at a FIXED input shape.
 // MIGraphX builds a static per-shape engine, so a model used at several resolutions in a
@@ -171,6 +181,13 @@ static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_
         if (probe.good()) {
             m->prog = migraphx::load(cache.c_str());
         } else {
+            // MLIR is MIGraphX's kernel-fusion JIT; for these SPAN convs it doesn't speed
+            // inference (measured 14 fps either way) but it dominates the per-resolution
+            // compile (210s -> 141s with it off). Default it off for a faster first play;
+            // a user can re-enable with MIGRAPHX_DISABLE_MLIR=0. (Dynamic-shape compile,
+            // which would compile once for all resolutions, is impossible here: the SPAN
+            // reflect-pad preamble has non-constant pads MIGraphX can't parse dynamically.)
+            setenv("MIGRAPHX_DISABLE_MLIR", "1", 0);
             migraphx::onnx_options oo;
             oo.set_input_parameter_shape(m->in_name, {1, 3, (size_t)in_h, (size_t)in_w});
             m->prog = migraphx::parse_onnx(onnx_path.c_str(), oo);
@@ -242,7 +259,7 @@ static int gpu_pre(aji_ctx* c, int W, int H, int format, int matrix, int range, 
     // reads only inputs/weights); parallelizing over rows leaves the inner tap
     // reduction order untouched, so the result stays bit-exact to the serial run.
     // Scratch lives in the ctx and is reused across frames (no per-frame mmap).
-    const int NT = c->nthreads;
+    const int NT = color_nt(c, (long)W * H);
     std::vector<float>& t0u = c->scratch.t0u; t0u.resize((size_t)W * ch);
     std::vector<float>& t0v = c->scratch.t0v; t0v.resize((size_t)W * ch);
     #pragma omp parallel for schedule(static) num_threads(NT)
@@ -281,7 +298,7 @@ static int gpu_pre(aji_ctx* c, int W, int H, int format, int matrix, int range, 
 // GLSL Spline36 resize: RGB fp32 NCHW (SW x SH x 3) -> RGB fp32 NCHW (DW x DH x 3).
 static int gpu_resize(aji_ctx* c, const RgbMat& src, int DW, int DH, RgbMat& dst) {
     const int SW = src.w, SH = src.h;
-    const int NT = c->nthreads;
+    const int NT = color_nt(c, (long)DW * DH);
     weights ph = aji_resample::compute(SW, DW, 0.0, AJI_FILTER_SPLINE36);
     weights pv = aji_resample::compute(SH, DH, 0.0, AJI_FILTER_SPLINE36);
     auto mirr = [](int i, int n){ i = i < 0 ? -i - 1 : i; i = i >= n ? 2*n - 1 - i : i; return i < 0 ? 0 : (i >= n ? n - 1 : i); };
@@ -313,8 +330,8 @@ static int gpu_resize(aji_ctx* c, const RgbMat& src, int DW, int DH, RgbMat& dst
 // siting is FORCED LEFT for the chroma downsample (zimg semantics on RGB->YUV).
 static int gpu_post(aji_ctx* c, const RgbMat& rgb, int format, int matrix, int range,
                     const aji_frame* out) {
-    const int NT = c->nthreads;
     const int W = rgb.w, H = rgb.h;
+    const int NT = color_nt(c, (long)W * H);
     const int cw = W >> 1, ch = H >> 1;
 
     aji_csp csp = aji_resample::make_csp(format, matrix, range);
@@ -482,6 +499,7 @@ AJI_EXPORT aji_ctx* aji_create(const aji_create_params* p) {
     c->log_opaque = p->log_opaque;
 #ifdef _OPENMP
     c->nthreads = std::max(1, std::min(8, omp_get_max_threads()));
+    c->nthreads_max = std::max(1, omp_get_max_threads());
 #endif
 
     if (p->conf_path && p->conf_path[0]) {
@@ -598,7 +616,7 @@ AJI_EXPORT int aji_infer(aji_ctx* c, const aji_frame* in, const aji_frame* out, 
             half_t* ib = c->scratch.mdl_in.get(n);
             if (!ib) { c->err = "pinned host alloc failed (in)"; return AJI_ERR; }
             const float* cb = cur->buf.data();
-            #pragma omp parallel for schedule(static) num_threads(c->nthreads)
+            #pragma omp parallel for schedule(static) num_threads(color_nt(c, (long)n))
             for (long i = 0; i < (long)n; i++) ib[i] = (half_t)cb[i];
 
             // Device-resident eval: copy fp16 input to its persistent device buffer, bind
@@ -630,7 +648,7 @@ AJI_EXPORT int aji_infer(aji_ctx* c, const aji_frame* in, const aji_frame* out, 
                 }
                 alt->create(OW, OH, 3);
                 float* ob = alt->buf.data(); const long on = (long)3 * OW * OH;
-                #pragma omp parallel for schedule(static) num_threads(c->nthreads)
+                #pragma omp parallel for schedule(static) num_threads(color_nt(c, on))
                 for (long i = 0; i < on; i++) ob[i] = (float)od[i];
                 std::swap(cur, alt);
             } catch (const std::exception& e) {
