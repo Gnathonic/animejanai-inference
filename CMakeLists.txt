@@ -193,6 +193,17 @@ if(AJI_MIGRAPHX_LIB AND AJI_HIP_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraph
     if(NOT WIN32)
         target_link_options(aji_rocm PRIVATE -Wl,-Bsymbolic)
     endif()
+
+    # Characterization test for the GPU out-color kernels (golden regression).
+    add_executable(aji_rocm_color_test test/rocm_color_test.cpp src/aji_rocm_color.hip)
+    set_source_files_properties(src/aji_rocm_color.hip PROPERTIES LANGUAGE HIP)
+    target_include_directories(aji_rocm_color_test PRIVATE include src "${AJI_ROCM_ROOT}/include")
+    target_compile_options(aji_rocm_color_test PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mf16c -mavx2 -mfma>)
+    target_compile_definitions(aji_rocm_color_test PRIVATE __HIP_PLATFORM_AMD__)
+    target_link_libraries(aji_rocm_color_test PRIVATE ${AJI_HIP_LIB})
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(aji_rocm_color_test PRIVATE OpenMP::OpenMP_CXX)
+    endif()
 else()
     message(STATUS "MIGraphX (${AJI_ROCM_ROOT} libmigraphx_c) not found; skipping aji_rocm.")
 endif()
