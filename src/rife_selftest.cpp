@@ -93,6 +93,53 @@ int main() {
         if (maxY>2 || maxC>2) printf("  color round-trip maxY=%d maxC=%d\n", maxY, maxC);
     }
 
+    // A5: color round-trip — padded centering + border-black + frame-B channel.
+    // Source 40x40 NV12 -> geometry(40,40) gives pw=ph=64, pad_l=pad_t=12.
+    // Write as frame B (frame_index=1, channels 3-5), round-trip via ch3-5,
+    // assert |out - in| <= 2 over the 40x40 window, and check that the padded
+    // border corner (ch3 at padded (0,0)) holds the BT.709 studio-black value.
+    {   const int W=40, H=40;
+        auto g = rife_cpu::geometry(W, H); // pw=ph=64, pad_l=pad_t=12
+        CHECK(g.pw == 64); CHECK(g.ph == 64);
+        CHECK(g.pad_l == 12); CHECK(g.pad_t == 12);
+        const int cw=W>>1, ch=H>>1;
+        std::vector<uint8_t> yin((size_t)W*H), uvin((size_t)cw*ch*2);
+        for (int y=0;y<H;y++) for (int x=0;x<W;x++)
+            yin[(size_t)y*W+x] = (uint8_t)(40 + (x*150)/(W-1));  // 40..190
+        for (int y=0;y<ch;y++) for (int x=0;x<cw;x++) {
+            uvin[((size_t)y*cw+x)*2]   = (uint8_t)(112 + (x*30)/(cw-1));
+            uvin[((size_t)y*cw+x)*2+1] = (uint8_t)(118 + (y*24)/(ch-1));
+        }
+        aji_frame frameB{}; frameB.width=W; frameB.height=H; frameB.format=AJI_FMT_NV12;
+        frameB.matrix=AJI_MATRIX_BT601; frameB.range=AJI_RANGE_LIMITED; frameB.siting=AJI_SITING_LEFT;
+        frameB.plane[0]=yin.data(); frameB.plane[1]=uvin.data();
+        frameB.stride[0]=W; frameB.stride[1]=cw*2;
+
+        const size_t plane=(size_t)g.pw*g.ph;
+        // Pre-fill with sentinel to distinguish untouched from border-black.
+        std::vector<float> tensor((size_t)11*plane, -999.f);
+        // Write frame B: channels 3,4,5
+        rife_cpu::yuv420_to_rgb_planes(frameB, g, tensor.data(), /*frame_index=*/1, AJI_RANGE_LIMITED);
+
+        // Round-trip back: rgb_planes_to_yuv420 reads 3 planes from tensor3 = ch3 base
+        std::vector<uint8_t> yout((size_t)W*H, 0), uvout((size_t)cw*ch*2, 0);
+        aji_frame out=frameB; out.plane[0]=yout.data(); out.plane[1]=uvout.data();
+        rife_cpu::rgb_planes_to_yuv420(tensor.data() + 3*plane, g, out, AJI_RANGE_LIMITED);
+
+        int maxY=0, maxC=0;
+        for (size_t i=0;i<yin.size();i++)  maxY = std::max(maxY, std::abs((int)yin[i]-(int)yout[i]));
+        for (size_t i=0;i<uvin.size();i++) maxC = std::max(maxC, std::abs((int)uvin[i]-(int)uvout[i]));
+        CHECK(maxY <= 2);
+        CHECK(maxC <= 2);
+        if (maxY>2 || maxC>2) printf("  padded color round-trip maxY=%d maxC=%d\n", maxY, maxC);
+
+        // Border assertion: ch3 at padded (0,0) must be studio-black RGB (≈0.0 for limited range).
+        // pad_l=pad_t=12 so (0,0) in the padded plane is OUTSIDE the 40x40 centered window.
+        float border_r = tensor[3*plane + 0];  // ch3, row=0, col=0 (padded top-left corner)
+        CHECK(std::abs(border_r) <= 1e-3f);
+        if (std::abs(border_r) > 1e-3f) printf("  border studio-black R=%g (expected ~0)\n", border_r);
+    }
+
     printf(g_fail ? "rife_selftest: %d FAILURES\n" : "rife_selftest: OK\n", g_fail);
     return g_fail ? 1 : 0;
 }
