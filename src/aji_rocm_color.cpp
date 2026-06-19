@@ -2,12 +2,16 @@
 // device.hip, embedded as AJI_ROCM_COLOR_SRC) are compiled for the GPU actually
 // present with hipRTC at first use and launched through the HIP module API. This is
 // what makes libaji_rocm.so portable across AMD archs (no baked --offload-arch),
-// mirroring MIGraphX's per-device .mxr JIT. Disk caching is added in a later step.
+// mirroring MIGraphX's per-device .mxr JIT. Compiled code objects are cached to
+// animejanai/cache/ (or $AJI_ROCM_CACHE_DIR) and self-heal on any load failure.
 #include "aji_rocm_color.h"
 #include "aji_rocm_color_device_src.h"   // generated: AJI_ROCM_COLOR_SRC[]
 #include <hip/hip_runtime.h>
 #include <hip/hiprtc.h>
-#include <mutex>
+#include <dlfcn.h>
+#include <fstream>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <cstdio>
@@ -21,6 +25,51 @@ struct ColorModule {
     std::string err;
 };
 
+// FNV-1a over the embedded source + a version tag; invalidates stale .co on a kernel edit.
+std::string src_hash() {
+    unsigned long long h = 1469598103934665603ULL;
+    const char* p = AJI_ROCM_COLOR_SRC;
+    const char* tag = "v1";                 // bump on launch-convention changes
+    for (const char* t = tag; *t; t++) { h ^= (unsigned char)*t; h *= 1099511628211ULL; }
+    for (; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+    char buf[17]; snprintf(buf, sizeof buf, "%016llx", h);
+    return buf;
+}
+
+// Cache dir: $AJI_ROCM_CACHE_DIR, else <dir-of-libaji_rocm.so>/../cache, else /tmp.
+std::string cache_dir() {
+    if (const char* e = getenv("AJI_ROCM_CACHE_DIR")) return e;
+    Dl_info info{};
+    if (dladdr((void*)&src_hash, &info) && info.dli_fname) {
+        std::string so = info.dli_fname;
+        size_t slash = so.find_last_of('/');
+        std::string dir = (slash == std::string::npos) ? "." : so.substr(0, slash);
+        return dir + "/../cache";
+    }
+    return "/tmp";
+}
+
+std::string cache_path(const std::string& arch) {
+    return cache_dir() + "/aji_color." + arch + "." + src_hash() + ".co";
+}
+
+bool read_file(const std::string& p, std::vector<char>& out) {
+    std::ifstream f(p, std::ios::binary | std::ios::ate);
+    if (!f) return false;
+    std::streamsize n = f.tellg(); if (n <= 0) return false;
+    out.resize((size_t)n); f.seekg(0);
+    return (bool)f.read(out.data(), n);
+}
+
+void write_file_atomic(const std::string& p, const std::vector<char>& data) {
+    // best-effort: mkdir the cache dir, write tmp, rename. Failure just means recompile next time.
+    std::string dir = p.substr(0, p.find_last_of('/'));
+    std::string mk = "mkdir -p '" + dir + "'"; (void)system(mk.c_str());
+    std::string tmp = p + ".tmp";
+    { std::ofstream f(tmp, std::ios::binary); if (!f) return; f.write(data.data(), (std::streamsize)data.size()); }
+    if (std::rename(tmp.c_str(), p.c_str()) != 0) std::remove(tmp.c_str());
+}
+
 // Compile AJI_ROCM_COLOR_SRC for the current device and resolve the kernels.
 ColorModule compile_module() {
     ColorModule m;
@@ -30,7 +79,31 @@ ColorModule compile_module() {
         m.err = "hipGetDeviceProperties failed"; return m;
     }
     std::string arch = prop.gcnArchName;   // e.g. "gfx1201" / "gfx1100:xnack-"
+    const std::string co = cache_path(arch);
 
+    // Resolve a loaded module's functions into m. Returns true on full success.
+    auto resolve = [&]() -> bool {
+        auto fn = [&](hipFunction_t* f, const char* name) {
+            return hipModuleGetFunction(f, m.mod, name) == hipSuccess;
+        };
+        return fn(&m.selftest, "k_selftest") &&
+               fn(&m.y_uvdiff, "k_out_y_uvdiff") &&
+               fn(&m.chroma_h, "k_out_chroma_h") &&
+               fn(&m.chroma_v, "k_out_chroma_v");
+    };
+
+    // 1) Try the cached code object. On ANY load failure, delete it and recompile.
+    std::vector<char> code;
+    if (read_file(co, code)) {
+        if (hipModuleLoadData(&m.mod, code.data()) == hipSuccess) {
+            if (resolve()) { m.ok = true; return m; }
+            hipModuleUnload(m.mod); m.mod = nullptr;
+        }
+        std::remove(co.c_str());   // stale/incompatible: heal by recompiling
+        code.clear();
+    }
+
+    // 2) Compile with hipRTC, then cache the bytes.
     hiprtcProgram prog{};
     if (hiprtcCreateProgram(&prog, AJI_ROCM_COLOR_SRC, "aji_rocm_color.hip", 0, nullptr, nullptr) != HIPRTC_SUCCESS) {
         m.err = "hiprtcCreateProgram failed"; return m;
@@ -47,18 +120,14 @@ ColorModule compile_module() {
         hiprtcDestroyProgram(&prog); return m;
     }
     size_t csz = 0; hiprtcGetCodeSize(prog, &csz);
-    std::vector<char> code(csz);
+    code.resize(csz);
     hiprtcGetCode(prog, code.data());
     hiprtcDestroyProgram(&prog);
 
+    write_file_atomic(co, code);
+
     if (hipModuleLoadData(&m.mod, code.data()) != hipSuccess) { m.err = "hipModuleLoadData failed"; return m; }
-    auto fn = [&](hipFunction_t* f, const char* name) {
-        return hipModuleGetFunction(f, m.mod, name) == hipSuccess;
-    };
-    if (!fn(&m.selftest, "k_selftest") || !fn(&m.y_uvdiff, "k_out_y_uvdiff") ||
-        !fn(&m.chroma_h, "k_out_chroma_h") || !fn(&m.chroma_v, "k_out_chroma_v")) {
-        m.err = "hipModuleGetFunction failed"; return m;
-    }
+    if (!resolve()) { m.err = "hipModuleGetFunction failed"; return m; }
     m.ok = true;
     return m;
 }
