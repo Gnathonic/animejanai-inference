@@ -3,6 +3,7 @@
 #include <string>
 #include <cstdint>
 #include <cstddef>
+#include <cmath>
 
 namespace rife_cpu {
 
@@ -26,5 +27,27 @@ inline Geom geometry(int w, int h) {
     return g;
 }
 
-// (functions added in A2, A3, A6, A7)
+inline bool scene_detect(const uint8_t* ya, ptrdiff_t sa, const uint8_t* yb, ptrdiff_t sb,
+                         int w, int h, int pw, int ph, double norm, double threshold) {
+    double sum = 0.0;
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* ra = ya + (ptrdiff_t)y * sa;
+        const uint8_t* rb = yb + (ptrdiff_t)y * sb;
+        for (int x = 0; x < w; ++x) sum += std::abs((int)ra[x] - (int)rb[x]) * norm;
+    }
+    return sum / ((double)pw * ph) > threshold;
+}
+
+inline bool scene_detect(const uint16_t* ya, ptrdiff_t sa, const uint16_t* yb, ptrdiff_t sb,
+                         int w, int h, int pw, int ph, double norm, double threshold) {
+    double sum = 0.0;
+    for (int y = 0; y < h; ++y) {
+        const uint16_t* ra = (const uint16_t*)((const uint8_t*)ya + (ptrdiff_t)y * sa);
+        const uint16_t* rb = (const uint16_t*)((const uint8_t*)yb + (ptrdiff_t)y * sb);
+        for (int x = 0; x < w; ++x) sum += std::abs((int)ra[x] - (int)rb[x]) * norm;
+    }
+    return sum / ((double)pw * ph) > threshold;
+}
+
+// (functions added in A2, A3, A4, A6, A7)
 }  // namespace rife_cpu

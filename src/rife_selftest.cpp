@@ -27,6 +27,19 @@ int main() {
       CHECK(g.pad_t == (((512-480)/2) & ~1));    // 16
     }
 
+    // A4: scene_detect tests
+    {   // identical frames -> no scene change
+        const int w=4,h=2; uint8_t a[8]={10,20,30,40,50,60,70,80}, b[8]; for(int i=0;i<8;i++) b[i]=a[i];
+        CHECK(rife_cpu::scene_detect(a, w, b, w, w, h, 64, 64, 1.0/255.0, 0.150) == false);
+    }
+    {   // hard cut: max difference everywhere -> scene change
+        const int w=4,h=2; uint8_t a[8]; uint8_t b[8]; for(int i=0;i<8;i++){a[i]=0;b[i]=255;}
+        // sum = 8*255*(1/255) = 8 ; /(64*64=4096) = 0.00195 < 0.15 -> NOT a scene at 64x64 padded
+        CHECK(rife_cpu::scene_detect(a, w, b, w, w, h, 64, 64, 1.0/255.0, 0.150) == false);
+        // but with padded area == unpadded (pw=4,ph=2 -> /8) -> 8/8=1.0 > 0.15 -> scene
+        CHECK(rife_cpu::scene_detect(a, w, b, w, w, h, 4, 2, 1.0/255.0, 0.150) == true);
+    }
+
     printf(g_fail ? "rife_selftest: %d FAILURES\n" : "rife_selftest: OK\n", g_fail);
     return g_fail ? 1 : 0;
 }
