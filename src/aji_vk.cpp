@@ -153,6 +153,15 @@ static std::unique_ptr<NcnnModel> load_model(aji_ctx* c, const std::string& para
     m->net.opt.use_fp16_packed = true;
     m->net.opt.use_fp16_storage = true;
     m->net.opt.use_fp16_arithmetic = true;
+    // ncnn has no TensorRT-style per-layer engine build; the closest wins are
+    // enabling the matrix-core (cooperative_matrix) GEMM path and Winograd 3x3 (the
+    // SPAN models are all 3x3 convs). Gated by device support inside ncnn, so safe to
+    // request unconditionally; AJI_VK_NO_CM=1 disables coopmat for A/B comparison.
+    m->net.opt.use_cooperative_matrix = getenv("AJI_VK_NO_CM") == nullptr;
+    m->net.opt.use_winograd_convolution = true;
+    m->net.opt.use_sgemm_convolution = true;
+    m->net.opt.use_subgroup_ops = true;
+    m->net.opt.use_shader_local_memory = true;
     if (m->net.load_param(param.c_str())) { c->err = "load_param failed: " + param; return nullptr; }
     std::string bin = bin_for(param);
     if (m->net.load_model(bin.c_str())) { c->err = "load_model failed: " + bin; return nullptr; }
