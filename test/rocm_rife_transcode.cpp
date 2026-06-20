@@ -1,30 +1,30 @@
 /*
- * rocm_rife_transcode — minimal ROCm OFFLINE RIFE+upscale transcode filter.
+ * rocm_rife_transcode — ROCm OFFLINE RIFE+upscale transcode filter (CONFIG MATRIX).
  *
  * A raw-frame stdin->stdout filter that drives the libaji_rocm engine (the
- * AMD/ROCm path) through the SAME conf/slot/model-dirs as rife_pipeline_bench:
- * a single chain that BOTH upscales (2x SD Compact) AND interpolates
- * (rife_v4.26, factor 2/1, rife_before_upscale=yes). 640x480 source -> 1280x960
- * output at 2x the input frame rate.
+ * AMD/ROCm path) through a caller-supplied conf/slot/model-dirs. Generalized
+ * from the original PRE-only NV12 tool to cover the full config matrix:
+ *
+ *   - PRE  (rife_before_upscale=yes): RIFE-first. Interpolate the SOURCE pair
+ *          at INPUT res, then upscale each result to output res.
+ *   - POST (rife_before_upscale=no) : upscale-first. Upscale each input, then
+ *          interpolate the UPSCALED pair at OUTPUT res.
+ *   - NO-RIFE (no rife in chain)    : upscale each input 1:1 (the A/B control).
  *
  * The real transcode CLI aji_encode (src/encode.c) is CUDA/NVDEC/NVENC-only and
  * won't build on this AMD box, so this tool replaces it for ROCm: ffmpeg does
  * decode+encode around it; this filter is just engine glue.
  *
- *   ffmpeg ... -f rawvideo -pix_fmt nv12 - \
- *     | rocm_rife_transcode W H FPS \
- *     | ffmpeg -f rawvideo -pix_fmt nv12 -s OUTWxOUTH -r OUTFPS -i - ... OUT.mp4
+ *   ffmpeg ... -f rawvideo -pix_fmt <nv12|p010le> - \
+ *     | rocm_rife_transcode --conf C --model-dir D --rife-model-dir R \
+ *                           --format <nv12|p010le> [--slot N] W H FPS \
+ *     | ffmpeg -f rawvideo -pix_fmt <nv12|p010le> -s OUTWxOUTH -r OUTFPS -i - ... OUT.mp4
  *
- * stdin : raw NV12 frames, each W*H*3/2 bytes (Y plane W*H, then interleaved
- *         CbCr W*H/2).
- * stdout: raw NV12 frames, each out_w*out_h*3/2 bytes, IN TIME ORDER, mirroring
- *         the player's grid (RIFE-first flow). For 2x: per new input frame we
- *         emit upscale(interp(prev,cur,0.5)) then upscale(cur). The very first
- *         frame emits just upscale(frame0).
+ * stdin : raw NV12 (W*H*3/2 bytes) or P010LE (W*H*3 bytes) frames.
+ * stdout: raw frames in the same pixel format at out_w x out_h, IN TIME ORDER.
  *
- * The frame construction (format NV12, matrix BT709, range LIMITED, siting LEFT,
- * host plane pointers) matches what rife_pipeline_bench feeds the engine and the
- * engine validated.
+ * Frame construction (matrix BT709, range LIMITED, siting LEFT, host plane
+ * pointers) matches what rife_pipeline_bench feeds the engine.
  */
 
 #include <cerrno>
@@ -40,37 +40,6 @@
 
 #include "aji.h"
 
-static const int SLOT = 2;
-static const char *CONF_TEXT =
-    "[global]\n"
-    "backend=rocm\n"
-    "logging=no\n"
-    "default_slot=2\n"
-    "\n"
-    "[slot_2]\n"
-    "profile_name=RIFE Transcode (SD Compact + rife426 before)\n"
-    "chain_1_min_resolution=0x0\n"
-    "chain_1_max_resolution=1280x720\n"
-    "chain_1_min_fps=0\n"
-    "chain_1_max_fps=31\n"
-    "chain_1_model_1_resize_height_before_upscale=0\n"
-    "chain_1_model_1_resize_factor_before_upscale=100\n"
-    "chain_1_model_1_name=2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo\n"
-    "chain_1_rife=yes\n"
-    "chain_1_rife_model=426\n"
-    "chain_1_rife_factor_numerator=2\n"
-    "chain_1_rife_factor_denominator=1\n"
-    "chain_1_rife_scene_detect_threshold=0.150\n"
-    "chain_1_rife_ensemble=no\n"
-    "chain_1_rife_before_upscale=yes\n";
-
-static const char *RIFE_DIR =
-    "/home/nathan/AnimeJaNai-Linux/mpv-upscale-2x_animejanai-v0.4.3-linux/"
-    "animejanai/rife";
-static const char *MODEL_DIR =
-    "/home/nathan/AnimeJaNai-Linux/mpv-upscale-2x_animejanai-v0.4.3-linux/"
-    "animejanai/onnx";
-
 static const double BUILD_TIMEOUT_S = 600.0;
 
 // stderr-only logging so stdout stays a clean rawvideo stream.
@@ -79,25 +48,43 @@ static void log_cb(void *opaque, int level, const char *msg) {
     fprintf(stderr, "[aji:%d] %s\n", level, msg);
 }
 
-// ---- host NV12 frame (8-bit) -----------------------------------------------
-struct NV12 {
+// ---- host 4:2:0 frame (NV12 8-bit OR P010LE 10-bit-in-16) ------------------
+// NV12 : Y = w*h bytes (8-bit), UV = (w/2)*(h/2)*2 bytes (interleaved CbCr).
+// P010 : Y = w*h*2 bytes (16-bit LE), UV = (w/2)*(h/2)*2*2 bytes (16-bit LE
+//        interleaved CbCr). Engine wants the P010 format constant with 16-bit
+//        strides; the 10 bits live in the MSBs but ffmpeg's rawvideo p010le is
+//        already MSB-aligned so we pass bytes through verbatim.
+struct Frame {
     int w = 0, h = 0;
-    std::vector<uint8_t> y, uv;   // y = w*h, uv = (w/2)*(h/2)*2 interleaved CbCr
+    int fmt = AJI_FMT_NV12;       // AJI_FMT_NV12 or AJI_FMT_P010
+    int bpp = 1;                  // bytes per sample (1 for NV12, 2 for P010)
+    std::vector<uint8_t> y, uv;
     aji_frame f{};
-    void alloc(int W_, int H_) {
-        w = W_; h = H_;
-        y.assign((size_t)w * h, 0);
-        uv.assign((size_t)(w / 2) * (h / 2) * 2, 128);
+    void alloc(int W_, int H_, int format) {
+        w = W_; h = H_; fmt = format;
+        bpp = (fmt == AJI_FMT_P010) ? 2 : 1;
+        y.assign((size_t)w * h * bpp, 0);
+        // chroma neutral: 8-bit 128, 16-bit MSB-aligned ~0x8000.
+        uv.assign((size_t)(w / 2) * (h / 2) * 2 * bpp, 0);
+        if (bpp == 1) {
+            for (auto &b : uv) b = 128;
+        } else {
+            uint16_t *p = (uint16_t *)uv.data();
+            size_t n = uv.size() / 2;
+            for (size_t i = 0; i < n; i++) p[i] = 0x8000;
+        }
         f.width = w; f.height = h;
-        f.format = AJI_FMT_NV12;
+        f.format = fmt;
         f.matrix = AJI_MATRIX_BT709;
         f.range = AJI_RANGE_LIMITED;
         f.siting = AJI_SITING_LEFT;
         f.plane[0] = y.data();  f.plane[1] = uv.data();  f.plane[2] = nullptr;
-        f.stride[0] = w;  f.stride[1] = w;  f.stride[2] = 0;
+        f.stride[0] = (ptrdiff_t)w * bpp;
+        f.stride[1] = (ptrdiff_t)w * bpp;     // interleaved CbCr: 2 * (w/2) * bpp = w*bpp
+        f.stride[2] = 0;
     }
-    size_t y_bytes()  const { return (size_t)w * h; }
-    size_t uv_bytes() const { return (size_t)(w / 2) * (h / 2) * 2; }
+    size_t y_bytes()  const { return (size_t)w * h * bpp; }
+    size_t uv_bytes() const { return (size_t)(w / 2) * (h / 2) * 2 * bpp; }
     size_t total()    const { return y_bytes() + uv_bytes(); }
 };
 
@@ -143,174 +130,270 @@ static int FAIL(const char *why) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4) {
+    const char *conf_path = nullptr;
+    const char *model_dir = nullptr;
+    const char *rife_model_dir = nullptr;
+    const char *format_str = nullptr;
+    int slot = 2;
+
+    // Parse options, collecting positional W H FPS.
+    std::vector<const char *> pos;
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--conf"))                 conf_path = (++i < argc) ? argv[i] : nullptr;
+        else if (!strcmp(a, "--model-dir"))       model_dir = (++i < argc) ? argv[i] : nullptr;
+        else if (!strcmp(a, "--rife-model-dir"))  rife_model_dir = (++i < argc) ? argv[i] : nullptr;
+        else if (!strcmp(a, "--format"))          format_str = (++i < argc) ? argv[i] : nullptr;
+        else if (!strcmp(a, "--slot"))            slot = (++i < argc) ? atoi(argv[i]) : slot;
+        else pos.push_back(a);
+    }
+
+    if (!conf_path || !model_dir || !rife_model_dir || !format_str || pos.size() < 3) {
         fprintf(stderr,
-                "usage: %s W H FPS   (raw NV12 in on stdin -> raw NV12 out on stdout)\n",
+                "usage: %s --conf <path> --model-dir <dir> --rife-model-dir <dir> "
+                "--format <nv12|p010le> [--slot N] W H FPS\n"
+                "  (raw frames in on stdin -> raw frames out on stdout)\n",
                 argv[0]);
         return 2;
     }
-    const int    W   = atoi(argv[1]);
-    const int    H   = atoi(argv[2]);
-    const double FPS = atof(argv[3]);
+
+    int format;
+    if (!strcmp(format_str, "nv12"))         format = AJI_FMT_NV12;
+    else if (!strcmp(format_str, "p010le"))  format = AJI_FMT_P010;
+    else return FAIL("bad --format (expected nv12 or p010le)");
+
+    const int    W   = atoi(pos[0]);
+    const int    H   = atoi(pos[1]);
+    const double FPS = atof(pos[2]);
     if (W <= 0 || H <= 0 || (W & 1) || (H & 1) || FPS <= 0)
         return FAIL("bad W/H/FPS (W,H must be positive even ints, FPS>0)");
 
-    fprintf(stderr, "rocm_rife_transcode: in=%dx%d fps=%.3f slot=%d\n", W, H, FPS, SLOT);
+    fprintf(stderr, "rocm_rife_transcode: in=%dx%d fps=%.3f slot=%d format=%s conf=%s\n",
+            W, H, FPS, slot, format_str, conf_path);
 
-    // 1. Write the temp conf (same chain as rife_pipeline_bench).
-    char conf_path[] = "/tmp/rocm_rife_transcodeXXXXXX.conf";
-    {
-        int fd = mkstemps(conf_path, 5);
-        if (fd < 0) { perror("mkstemps"); return FAIL("temp conf"); }
-        size_t L = strlen(CONF_TEXT);
-        if (write(fd, CONF_TEXT, L) != (ssize_t)L) { close(fd); return FAIL("write temp conf"); }
-        close(fd);
-    }
-
-    // 2. Create the engine (conf mode, async build).
+    // Create the engine (conf mode, async build). --conf passed straight through.
     aji_create_params p{};
     p.api_version = AJI_API_VERSION;
     p.conf_path = conf_path;
-    p.model_dir = MODEL_DIR;
-    p.rife_model_dir = RIFE_DIR;
-    p.slot = SLOT;
+    p.model_dir = model_dir;
+    p.rife_model_dir = rife_model_dir;
+    p.slot = slot;
     p.async_build = 1;
     p.log = log_cb;
 
     aji_ctx *c = aji_create(&p);
-    if (!c) { unlink(conf_path); return FAIL("aji_create returned NULL"); }
+    if (!c) return FAIL("aji_create returned NULL");
 
     int ow = 0, oh = 0;
     int act = aji_configure(c, W, H, FPS, &ow, &oh);
     if (act < 0) {
         fprintf(stderr, "configure err %d: %s\n", act, aji_last_error(c));
-        aji_destroy(&c); unlink(conf_path); return FAIL("initial aji_configure errored");
+        aji_destroy(&c); return FAIL("initial aji_configure errored");
     }
 
-    // 3. Poll until upscale chain active AND RIFE loaded (mirror the bench's wait).
+    // Poll until upscale chain active. RIFE may or may not be present; if a
+    // rife factor is configured we also wait for it to load.
     int num = 0, den = 0;
     int polls = 0;
     bool sawCompile = false;
     double elapsed = 0;
-    while (!(act == 1 && aji_rife_factor(c, &num, &den) == 1)) {
+    auto ready = [&]() -> bool {
+        if (act != 1) return false;
+        // If RIFE is configured (factor != 1) wait for it; else active is enough.
+        int rn = 0, rd = 0;
+        int rf = aji_rife_factor(c, &rn, &rd);
+        if (rf == 1) { num = rn; den = rd; return true; }       // rife loaded
+        // rf != 1 means either no-rife OR rife not yet loaded. We can't tell
+        // those apart cheaply, so give the build loop a bounded grace period;
+        // once a compile has settled and the chain is active with no pending
+        // build, treat rf!=1 as NO-RIFE.
+        return false;
+    };
+    bool no_rife = false;
+    while (!ready()) {
         if (elapsed > BUILD_TIMEOUT_S) {
             fprintf(stderr, "last log: %s\nlast error: %s\n",
                     aji_current_log(c), aji_last_error(c));
-            aji_destroy(&c); unlink(conf_path);
+            aji_destroy(&c);
             return FAIL("engine(s) not ready before timeout");
         }
-        if (aji_poll(c) == 1) {
+        int pr = aji_poll(c);
+        if (pr == 1) {
             sawCompile = true;
             fprintf(stderr, "[%.1fs] aji_poll: a build finished -> reconfigure\n", elapsed);
             act = aji_configure(c, W, H, FPS, &ow, &oh);
             if (act < 0) {
                 fprintf(stderr, "reconfigure err %d: %s\n", act, aji_last_error(c));
-                aji_destroy(&c); unlink(conf_path); return FAIL("reconfigure errored");
+                aji_destroy(&c); return FAIL("reconfigure errored");
             }
+        } else if (pr == 0 && act == 1) {
+            // No pending build and chain active, but rife factor still != 1:
+            // this is a NO-RIFE chain. Stop waiting.
+            int rn = 0, rd = 0;
+            if (aji_rife_factor(c, &rn, &rd) != 1) { no_rife = true; break; }
         } else if ((polls++ % 25) == 0) {
-            fprintf(stderr, "[%.1fs] waiting for engine(s)... active=%d rife=%d (%s)\n",
-                    elapsed, act, aji_rife_factor(c, &num, &den), aji_current_log(c));
+            fprintf(stderr, "[%.1fs] waiting for engine(s)... active=%d (%s)\n",
+                    elapsed, act, aji_current_log(c));
         }
         usleep(200 * 1000);
         elapsed += 0.2;
     }
 
-    const int rife_before = aji_rife_before_upscale(c);
-    fprintf(stderr, "[%.1fs] engines READY%s. out=%dx%d  rife_factor=%d/%d before_upscale=%d\n",
+    const int rife_before = no_rife ? -1 : aji_rife_before_upscale(c);
+    const char *mode = no_rife ? "NO-RIFE" : (rife_before == 1 ? "PRE" : "POST");
+    fprintf(stderr,
+            "[%.1fs] engines READY%s. out=%dx%d  rife_factor=%d/%d before_upscale=%d MODE=%s\n",
             elapsed, sawCompile ? " (a COMPILE happened — not fully cached)" : " (all cached)",
-            ow, oh, num, den, rife_before);
+            ow, oh, num, den, rife_before, mode);
 
-    // 4. Validate the chain shape (must match deployment / bench).
-    if (act != 1)                  { aji_destroy(&c); unlink(conf_path); return FAIL("chain not active"); }
-    if (ow != W * 2 || oh != H * 2){ aji_destroy(&c); unlink(conf_path); return FAIL("output dims != 2x source"); }
-    if (num < 1 || den < 1)        { aji_destroy(&c); unlink(conf_path); return FAIL("rife factor invalid"); }
-    if (rife_before != 1)          { aji_destroy(&c); unlink(conf_path); return FAIL("rife not before_upscale"); }
-
-    // 5. Frame buffers. Two source slots (prev/cur, ping-ponged), one interp
-    //    (source res), one upscaled output.
-    NV12 srcA, srcB, interp, up;
-    srcA.alloc(W, H); srcB.alloc(W, H);
-    interp.alloc(W, H);
-    up.alloc(ow, oh);
-
-    const size_t in_frame_bytes  = srcA.total();        // W*H*3/2
-    const size_t out_frame_bytes = up.total();          // ow*oh*3/2
-    fprintf(stderr, "rocm_rife_transcode: in_frame=%zuB out_frame=%zuB  grid=%d/%d\n",
-            in_frame_bytes, out_frame_bytes, num, den);
+    // Validate chain shape: active, integer scale derived from configure.
+    if (act != 1) { aji_destroy(&c); return FAIL("chain not active"); }
+    if (ow <= 0 || oh <= 0 || (ow % W) != 0 || (oh % H) != 0) {
+        aji_destroy(&c); return FAIL("output dims not a positive integer multiple of source");
+    }
+    if (!no_rife && (num < 1 || den < 1)) { aji_destroy(&c); return FAIL("rife factor invalid"); }
 
     const int IN_FD = 0, OUT_FD = 1;
 
-    // Upscale a source-res frame `in` -> `up`, synchronously, and write `up` to stdout.
-    auto upscale_and_emit = [&](const aji_frame *in) -> int {
-        int s = aji_infer(c, in, &up.f, nullptr);
+    // Write a frame (Y then UV) to stdout.
+    auto emit_frame = [&](const Frame &fr) -> int {
+        return write_full(OUT_FD, fr.y.data(), fr.y_bytes()) == 0 &&
+               write_full(OUT_FD, fr.uv.data(), fr.uv_bytes()) == 0 ? 0 : -1;
+    };
+
+    // Upscale `in` -> `dst` synchronously.
+    auto upscale = [&](const aji_frame *in, Frame &dst) -> int {
+        int s = aji_infer(c, in, &dst.f, nullptr);
         if (s != AJI_OK) { fprintf(stderr, "aji_infer err %d: %s\n", s, aji_last_error(c)); return -1; }
         int w = aji_wait(c, aji_flush(c, nullptr));
         if (w != AJI_OK) { fprintf(stderr, "aji_wait err %d: %s\n", w, aji_last_error(c)); return -1; }
-        return write_full(OUT_FD, up.y.data(), up.y_bytes()) == 0 &&
-               write_full(OUT_FD, up.uv.data(), up.uv_bytes()) == 0 ? 0 : -1;
+        return 0;
     };
 
-    // 6. Stream. RIFE-first flow, walking the num/den grid per input frame.
-    NV12 *prev = &srcA, *cur = &srcB;
+    // Read one input frame into `dst`. Returns 1 read, 0 clean EOF, -1 truncated.
+    auto read_frame = [&](Frame &dst, uint64_t idx) -> int {
+        ssize_t ry = read_full(IN_FD, dst.y.data(), dst.y_bytes());
+        if (ry == 0) return 0;
+        if (ry < 0) { fprintf(stderr, "truncated Y at frame %llu — stopping\n",
+                              (unsigned long long)idx); return -1; }
+        ssize_t ru = read_full(IN_FD, dst.uv.data(), dst.uv_bytes());
+        if (ru <= 0) { fprintf(stderr, "truncated UV at frame %llu — stopping\n",
+                              (unsigned long long)idx); return -1; }
+        return 1;
+    };
+
     uint64_t in_count = 0, out_count = 0, scene_skips = 0;
 
-    while (true) {
-        NV12 *dst = (in_count == 0) ? prev : cur;
-        // read Y then UV (one NV12 frame).
-        ssize_t ry = read_full(IN_FD, dst->y.data(), dst->y_bytes());
-        if (ry == 0) break;                              // clean EOF at boundary
-        if (ry < 0) { fprintf(stderr, "truncated Y at frame %llu — stopping\n",
-                              (unsigned long long)in_count); break; }
-        ssize_t ru = read_full(IN_FD, dst->uv.data(), dst->uv_bytes());
-        if (ru <= 0) { fprintf(stderr, "truncated UV at frame %llu — stopping\n",
-                              (unsigned long long)in_count); break; }
+    if (no_rife) {
+        // ---- NO-RIFE: upscale each input 1:1 -----------------------------
+        Frame src, up;
+        src.alloc(W, H, format);
+        up.alloc(ow, oh, format);
+        fprintf(stderr, "rocm_rife_transcode: in_frame=%zuB out_frame=%zuB (NO-RIFE 1:1)\n",
+                src.total(), up.total());
+        while (true) {
+            int r = read_frame(src, in_count);
+            if (r == 0) break;
+            if (r < 0) break;
+            if (upscale(&src.f, up) != 0) { aji_destroy(&c); return FAIL("upscale (no-rife)"); }
+            if (emit_frame(up) != 0)      { aji_destroy(&c); return FAIL("emit (no-rife)"); }
+            in_count++; out_count++;
+        }
+    } else if (rife_before == 1) {
+        // ---- PRE: RIFE-first. Interp SOURCE pair, upscale each result. ----
+        Frame srcA, srcB, interp, up;
+        srcA.alloc(W, H, format); srcB.alloc(W, H, format);
+        interp.alloc(W, H, format);
+        up.alloc(ow, oh, format);
+        fprintf(stderr, "rocm_rife_transcode: in_frame=%zuB out_frame=%zuB grid=%d/%d (PRE)\n",
+                srcA.total(), up.total(), num, den);
 
-        if (in_count == 0) {
-            // First frame: just upscale it -> 1 output frame. prev already holds it.
-            if (upscale_and_emit(&prev->f) != 0) { aji_destroy(&c); unlink(conf_path); return FAIL("emit frame0"); }
+        auto upscale_and_emit = [&](const aji_frame *in) -> int {
+            if (upscale(in, up) != 0) return -1;
+            return emit_frame(up);
+        };
+
+        Frame *prev = &srcA, *cur = &srcB;
+        const int steps = num / den;
+        while (true) {
+            Frame *dst = (in_count == 0) ? prev : cur;
+            int r = read_frame(*dst, in_count);
+            if (r == 0) break;
+            if (r < 0) break;
+
+            if (in_count == 0) {
+                if (upscale_and_emit(&prev->f) != 0) { aji_destroy(&c); return FAIL("emit frame0"); }
+                out_count++; in_count++;
+                continue;
+            }
+            for (int k = 1; k < steps; k++) {
+                double t = (double)k / (double)steps;
+                int rr = aji_infer_rife(c, &prev->f, &cur->f, t, &interp.f, nullptr);
+                const aji_frame *interp_in = &interp.f;
+                if (rr == AJI_SCENE) { scene_skips++; interp_in = &prev->f; }
+                else if (rr != AJI_OK) {
+                    fprintf(stderr, "aji_infer_rife err %d: %s\n", rr, aji_last_error(c));
+                    aji_destroy(&c); return FAIL("rife infer (PRE)");
+                }
+                if (upscale_and_emit(interp_in) != 0) { aji_destroy(&c); return FAIL("emit interp (PRE)"); }
+                out_count++;
+            }
+            if (upscale_and_emit(&cur->f) != 0) { aji_destroy(&c); return FAIL("emit cur (PRE)"); }
             out_count++;
             in_count++;
-            continue;
+            std::swap(prev, cur);
         }
+    } else {
+        // ---- POST: upscale-first. Interp the UPSCALED pair at OUTPUT res. --
+        Frame src, upA, upB, interp;
+        src.alloc(W, H, format);
+        upA.alloc(ow, oh, format); upB.alloc(ow, oh, format);
+        interp.alloc(ow, oh, format);
+        fprintf(stderr, "rocm_rife_transcode: in_frame=%zuB out_frame=%zuB grid=%d/%d (POST)\n",
+                src.total(), upA.total(), num, den);
 
-        // Subsequent frame in `cur`: walk the grid between prev and cur.
-        // For each integer k in (0, num/den), the fractional time is t=k/(num/den)
-        // = k*den/num in (0,1) -> an interpolated frame; then the integer point
-        // (k == num/den) emits the real upscaled cur. With factor 2/1 the grid is
-        // {0.5 (interp), 1.0 (cur)} = upscale(interp(prev,cur,0.5)), upscale(cur).
-        // General num/den: emit (num/den - 1) interpolated frames then cur. We
-        // require den==1 here for the integer grid the player uses; den>1 chains
-        // aren't part of this conf, so assert it.
-        const int steps = num / den;                     // den==1 for this conf
-        for (int k = 1; k < steps; k++) {
-            double t = (double)k / (double)steps;        // in (0,1)
-            int rr = aji_infer_rife(c, &prev->f, &cur->f, t, &interp.f, nullptr);
-            const aji_frame *interp_in = &interp.f;
-            if (rr == AJI_SCENE) {
-                // Scene change: engine contract says emit a duplicate of `a` (prev).
-                scene_skips++;
-                interp_in = &prev->f;
-            } else if (rr != AJI_OK) {
-                fprintf(stderr, "aji_infer_rife err %d: %s\n", rr, aji_last_error(c));
-                aji_destroy(&c); unlink(conf_path); return FAIL("rife infer");
+        Frame *up_prev = &upA, *up_cur = &upB;
+        const int steps = num / den;
+        while (true) {
+            int r = read_frame(src, in_count);
+            if (r == 0) break;
+            if (r < 0) break;
+
+            if (in_count == 0) {
+                // first input -> upscale -> emit -> keep as up_prev.
+                if (upscale(&src.f, *up_prev) != 0) { aji_destroy(&c); return FAIL("upscale frame0 (POST)"); }
+                if (emit_frame(*up_prev) != 0)      { aji_destroy(&c); return FAIL("emit frame0 (POST)"); }
+                out_count++; in_count++;
+                continue;
             }
-            if (upscale_and_emit(interp_in) != 0) { aji_destroy(&c); unlink(conf_path); return FAIL("emit interp"); }
+            // later input -> up_cur = upscale(f).
+            if (upscale(&src.f, *up_cur) != 0) { aji_destroy(&c); return FAIL("upscale cur (POST)"); }
+            for (int k = 1; k < steps; k++) {
+                double t = (double)k / (double)steps;
+                int rr = aji_infer_rife(c, &up_prev->f, &up_cur->f, t, &interp.f, nullptr);
+                const Frame *interp_in = &interp;
+                if (rr == AJI_SCENE) { scene_skips++; interp_in = up_prev; }   // emit dup of up_prev
+                else if (rr != AJI_OK) {
+                    fprintf(stderr, "aji_infer_rife err %d: %s\n", rr, aji_last_error(c));
+                    aji_destroy(&c); return FAIL("rife infer (POST)");
+                }
+                if (emit_frame(*interp_in) != 0) { aji_destroy(&c); return FAIL("emit interp (POST)"); }
+                out_count++;
+            }
+            // emit the real upscaled cur.
+            if (emit_frame(*up_cur) != 0) { aji_destroy(&c); return FAIL("emit cur (POST)"); }
             out_count++;
+            in_count++;
+            std::swap(up_prev, up_cur);
         }
-        // Integer point: the real cur frame, upscaled.
-        if (upscale_and_emit(&cur->f) != 0) { aji_destroy(&c); unlink(conf_path); return FAIL("emit cur"); }
-        out_count++;
-
-        in_count++;
-        std::swap(prev, cur);                            // cur becomes next prev
     }
 
+    fprintf(stderr, "rocm_rife_transcode: MODE=%s\n", mode);
     fprintf(stderr,
             "rocm_rife_transcode: DONE  in_frames=%llu out_frames=%llu scene_skips=%llu\n",
             (unsigned long long)in_count, (unsigned long long)out_count,
             (unsigned long long)scene_skips);
 
     aji_destroy(&c);
-    unlink(conf_path);
     return 0;
 }
