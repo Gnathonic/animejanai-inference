@@ -30,6 +30,7 @@
 #include "aji_conf.h"
 #include "resample.h"
 #include "aji_rocm_color.h"   // GPU-resident color kernels (Phase B)
+#include "rife_cpu.h"
 
 #include <migraphx/migraphx.hpp>
 #include <hip/hip_runtime_api.h>
@@ -229,6 +230,29 @@ struct aji_ctx {
     // 1080p->4K case); gated by AJI_ROCM_GPU_COLOR. gc holds the device state.
     bool gpu_color_eligible = false;
     GpuColor gc;
+
+    // RIFE interpolation state. Populated by setup_rife (A8); used by aji_infer_rife (A9).
+    struct RifeState {
+        std::unique_ptr<MgxModel> model;
+        rife_cpu::Geom g{};
+        int    num = 1, den = 1;
+        double scd_threshold = 0.150;
+        bool   before_upscale = true, enabled = false, loaded = false;
+        PinnedHalf pin_in, pin_out;                            // dedicated pinned host fp16
+        std::vector<float> assembly;                           // 11*plane fp32 (consts + per-frame)
+
+        // Reconfigure-safe reset: drop the model + assembly and disable, so stale RIFE
+        // state never leaks across an aji_configure that changes/removes RIFE. The model,
+        // pinned, and assembly buffers free themselves via their own dtors.
+        void reset() {
+            model.reset();
+            assembly.clear();
+            enabled = loaded = false;
+        }
+    };
+    RifeState rife;
+    std::string rife_model_dir;
+    std::mutex gpu_eval_mtx;
 };
 
 static void logmsg(aji_ctx* c, int level, const char* m) {
@@ -247,14 +271,17 @@ static int round_even(double x) {
 // onto the GPU (P4), not more CPU threads.
 static inline int color_nt(const aji_ctx* c, long /*npix*/) { return c->nthreads; }
 
-// The cache file for one engine: <onnx>.<W>x<H>.dev.mlir.fp16.mxr next to the model. The
-// ".mlir" tag invalidates the older MLIR-disabled engines, which had a non-deterministic
-// MIOpen-fallback conv artifact (evenly-spaced column static) at 4K.
-static std::string mxr_cache_path(const std::string& onnx, int w, int h) {
-    return onnx + "." + std::to_string(w) + "x" + std::to_string(h) + ".dev.mlir.fp16.mxr";
+// The cache file for one engine: <onnx>.<W>x<H>.c<channels>.dev.mlir.fp16.mxr next to the
+// model. The channel count is folded into the key so an 11-ch RIFE engine at the same
+// resolution can't collide with a 3-ch upscaler engine. The ".mlir" tag invalidates the
+// older MLIR-disabled engines, which had a non-deterministic MIOpen-fallback conv artifact
+// (evenly-spaced column static) at 4K.
+static std::string mxr_cache_path(const std::string& onnx, int w, int h, int channels = 3) {
+    return onnx + "." + std::to_string(w) + "x" + std::to_string(h)
+           + ".c" + std::to_string(channels) + ".dev.mlir.fp16.mxr";
 }
-static bool mxr_cached(const std::string& onnx, int w, int h) {
-    std::ifstream probe(mxr_cache_path(onnx, w, h), std::ios::binary);
+static bool mxr_cached(const std::string& onnx, int w, int h, int channels = 3) {
+    std::ifstream probe(mxr_cache_path(onnx, w, h, channels), std::ios::binary);
     return probe.good();
 }
 
@@ -263,7 +290,8 @@ static bool mxr_cached(const std::string& onnx, int w, int h) {
 // temp file then atomically renames into place, so an interrupted compile (player quit
 // mid-build) never leaves a half-written .mxr that would later fail to load.
 // Returns false + *errout on error.
-static bool compile_mxr(const std::string& onnx_path, int in_w, int in_h, std::string* errout) {
+static bool compile_mxr(const std::string& onnx_path, int in_w, int in_h, std::string* errout,
+                        int in_channels = 3) {
     try {
         // MLIR (rocMLIR) is the DEFAULT conv codegen on RDNA and is REQUIRED for correctness:
         // disabling it falls back to a MIOpen conv solver that reads uninitialized workspace at
@@ -274,12 +302,12 @@ static bool compile_mxr(const std::string& onnx_path, int in_w, int in_h, std::s
         // experiments. (Dynamic-shape compile is still impossible: the SPAN reflect-pad preamble
         // has non-constant pads MIGraphX can't parse dynamically.)
         migraphx::onnx_options oo;
-        oo.set_input_parameter_shape("input", {1, 3, (size_t)in_h, (size_t)in_w});
+        oo.set_input_parameter_shape("input", {1, (size_t)in_channels, (size_t)in_h, (size_t)in_w});
         auto prog = migraphx::parse_onnx(onnx_path.c_str(), oo);
         migraphx::quantize_fp16(prog);
         migraphx::compile_options co; co.set_offload_copy(false);  // device-resident
         prog.compile(migraphx::target("gpu"), co);
-        const std::string cache = mxr_cache_path(onnx_path, in_w, in_h);
+        const std::string cache = mxr_cache_path(onnx_path, in_w, in_h, in_channels);
         const std::string tmp = cache + ".tmp." + std::to_string(in_w) + "x" + std::to_string(in_h);
         migraphx::save(prog, tmp.c_str());
         if (std::rename(tmp.c_str(), cache.c_str()) != 0) {
@@ -296,14 +324,15 @@ static bool compile_mxr(const std::string& onnx_path, int in_w, int in_h, std::s
 // Kick a background compile of one engine; the configure that called this returns
 // passthrough and aji_poll() reports when to reconfigure. The worker captures only a
 // shared_ptr to the BuildState (never the ctx), so it outlives the ctx safely.
-static void start_async_build(aji_ctx* c, const std::string& onnx, int w, int h) {
+static void start_async_build(aji_ctx* c, const std::string& onnx, int w, int h,
+                              int in_channels = 3) {
     if (c->build_thread.joinable()) c->build_thread.join();  // reap a previous finished worker
     auto bs = std::make_shared<BuildState>();
-    bs->onnx = onnx; bs->key = mxr_cache_path(onnx, w, h); bs->w = w; bs->h = h;
+    bs->onnx = onnx; bs->key = mxr_cache_path(onnx, w, h, in_channels); bs->w = w; bs->h = h;
     c->build = bs;
-    c->build_thread = std::thread([bs]() {
+    c->build_thread = std::thread([bs, in_channels]() {
         std::string e;
-        bool ok = compile_mxr(bs->onnx, bs->w, bs->h, &e);
+        bool ok = compile_mxr(bs->onnx, bs->w, bs->h, &e, in_channels);
         bs->err = e;
         bs->ok.store(ok);
         bs->done.store(1);   // release: main reads ok/err only after seeing done==1
@@ -314,18 +343,20 @@ static void start_async_build(aji_ctx* c, const std::string& onnx, int w, int h)
 // already be on disk (the async path defers an uncached model before reaching here; the
 // sync path compiles it inline first). MIGraphX builds a static per-shape engine, so a
 // model used at several resolutions in a chain gets one engine per resolution.
+// in_channels == 11 selects the RIFE path: output is the 3-channel non-input 4D param,
+// scale is fixed at 1, and both shapes are hard-asserted.
 static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_path,
-                                            int in_w, int in_h) {
+                                            int in_w, int in_h, int in_channels = 3) {
     auto m = std::make_unique<MgxModel>();
     m->in_w = in_w; m->in_h = in_h;
-    m->in_name = "input";   // the SPAN dynamo export's input blob name
+    m->in_name = "input";   // the SPAN dynamo export's input blob name; same for RIFE
 
-    const std::string cache = mxr_cache_path(onnx_path, in_w, in_h);
+    const std::string cache = mxr_cache_path(onnx_path, in_w, in_h, in_channels);
     try {
-        if (!mxr_cached(onnx_path, in_w, in_h)) {
+        if (!mxr_cached(onnx_path, in_w, in_h, in_channels)) {
             // sync (CLI/benchmark) path: async_build defers before getting here
             std::string e;
-            if (!compile_mxr(onnx_path, in_w, in_h, &e)) { c->err = e; return nullptr; }
+            if (!compile_mxr(onnx_path, in_w, in_h, &e, in_channels)) { c->err = e; return nullptr; }
         }
         m->prog = migraphx::load(cache.c_str());
     } catch (const std::exception& e) {
@@ -334,7 +365,10 @@ static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_
     }
 
     // One device buffer per program parameter (input + main:#output_0 [+ scratch]),
-    // allocated once. The output is the 4D non-input param; scale = out_h / in_h.
+    // allocated once. For upscale (in_channels==3): the output is the last 4D non-input
+    // param; scale = out_h / in_h. For RIFE (in_channels==11): the output is the non-input
+    // 4D param whose second dimension is 3; shapes are hard-asserted.
+    const bool is_rife = (in_channels == 11);
     try {
         auto ps = m->prog.get_parameter_shapes();
         for (auto&& name : ps.names()) {
@@ -355,13 +389,52 @@ static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_
             hipMemset(p.dev, 0, p.bytes);
             if (getenv("AJI_ROCM_GPU_COLOR_DEBUG"))
                 fprintf(stderr, "[param] %s  bytes=%zu  is_input=%d\n", p.name.c_str(), p.bytes, (int)p.is_input);
-            if (!p.is_input && p.dims.size() == 4) {
-                m->out_h = (int)p.dims[2]; m->out_w = (int)p.dims[3]; m->out_bytes = p.bytes;
+            if (!is_rife) {
+                // Upscale path: last-wins 4D non-input param is the output.
+                if (!p.is_input && p.dims.size() == 4) {
+                    m->out_h = (int)p.dims[2]; m->out_w = (int)p.dims[3]; m->out_bytes = p.bytes;
+                }
+            } else {
+                // RIFE path: output is the FIRST non-input 4D param with dims[1]==3.
+                // Guard with out_h==0 so a later scratch param with the same channel
+                // count can't overwrite the real output latch.
+                if (!p.is_input && p.dims.size() == 4 && p.dims[1] == 3 && m->out_h == 0) {
+                    m->out_h = (int)p.dims[2]; m->out_w = (int)p.dims[3]; m->out_bytes = p.bytes;
+                }
             }
             m->params.push_back(std::move(p));
         }
-        if (m->out_h <= 0 || m->out_h % in_h != 0) { c->err = "model output shape not a scale of input"; return nullptr; }
-        m->scale = m->out_h / in_h;
+
+        if (!is_rife) {
+            // Upscale: output must be an integer scale of the input.
+            if (m->out_h <= 0 || m->out_h % in_h != 0) { c->err = "model output shape not a scale of input"; return nullptr; }
+            m->scale = m->out_h / in_h;
+        } else {
+            // RIFE: assert input {1,11,in_h,in_w} and output {1,3,in_h,in_w}.
+            // Silently miscompiled dynamic-channel graphs abort at Concat, so fail loudly here.
+            bool input_ok = false, output_ok = false;
+            for (auto& p : m->params) {
+                if (p.is_input && p.dims.size() == 4 &&
+                    p.dims[0] == 1 && p.dims[1] == 11 &&
+                    p.dims[2] == (size_t)in_h && p.dims[3] == (size_t)in_w)
+                    input_ok = true;
+                if (!p.is_input && p.dims.size() == 4 &&
+                    p.dims[0] == 1 && p.dims[1] == 3 &&
+                    p.dims[2] == (size_t)in_h && p.dims[3] == (size_t)in_w)
+                    output_ok = true;
+            }
+            if (!input_ok) {
+                c->err = "RIFE engine: input param is not {1,11," + std::to_string(in_h)
+                         + "," + std::to_string(in_w) + "} — wrong model or shape";
+                return nullptr;
+            }
+            if (!output_ok) {
+                c->err = "RIFE engine: output param is not {1,3," + std::to_string(in_h)
+                         + "," + std::to_string(in_w) + "} — wrong model or shape";
+                return nullptr;
+            }
+            m->scale = 1;  // RIFE is temporal interpolation, not spatial upscale
+        }
     } catch (const std::exception& e) {
         c->err = "migraphx param setup failed: " + std::string(e.what());
         return nullptr;
@@ -555,10 +628,12 @@ static int gpu_post(aji_ctx* c, const RgbMat& rgb, int format, int matrix, int r
 // success the model is pushed into c->models and its scale (>0) returned. Returns -1 on a
 // hard load error. On defer/failure it sets a marker in c->log for engine_monitor.lua.
 // Returns: >0 scale (loaded), 0 deferred to a background build, -1 error.
+// in_channels defaults to 3 (upscale path); pass 11 for RIFE so the cache key and
+// compile both use the correct channel count.
 static int ensure_model(aji_ctx* c, const std::string& onnx, const std::string& name,
-                        int in_w, int in_h) {
-    if (c->async_build && !mxr_cached(onnx, in_w, in_h)) {
-        const std::string key = mxr_cache_path(onnx, in_w, in_h);
+                        int in_w, int in_h, int in_channels = 3) {
+    if (c->async_build && !mxr_cached(onnx, in_w, in_h, in_channels)) {
+        const std::string key = mxr_cache_path(onnx, in_w, in_h, in_channels);
         char res[32]; snprintf(res, sizeof res, "%dx%d", in_w, in_h);
         if (c->failed_builds.count(key)) {
             c->log = "MIGraphX engine build FAILED for " + name + " for " + res +
@@ -568,16 +643,114 @@ static int ensure_model(aji_ctx* c, const std::string& onnx, const std::string& 
         // One build at a time: a multi-engine chain cascades through repeated
         // poll() -> reconfigure cycles, building the next uncached engine each time.
         bool building = c->build && c->build->done.load() == 0;
-        if (!building) start_async_build(c, onnx, in_w, in_h);
+        if (!building) start_async_build(c, onnx, in_w, in_h, in_channels);
         c->log = "Building MIGraphX engine for " + name + " for " + res +
                  " (first play at this resolution)";
         return 0;
     }
-    auto m = load_model(c, onnx, in_w, in_h);
+    auto m = load_model(c, onnx, in_w, in_h, in_channels);
     if (!m) { logmsg(c, 2, c->err.c_str()); return -1; }
     int sc = m->scale;
     c->models.push_back(std::move(m));
     return sc;
+}
+
+// Configure RIFE interpolation for the active chain (called from build_plan, replacing
+// the old "not supported" drop). Mirrors ensure_model's async-build cascade, but the
+// compiled engine lands in c->rife.model (NOT c->models — it is driven by aji_infer_rife,
+// not the upscale step loop) and there is no spatial scale. The RIFE .mxr rides the SAME
+// single-build slot as the upscale engines, so a cold-cache upscale+RIFE chain cascades
+// one compile per poll->reconfigure cycle.
+//   LOADED   — engine on disk + loaded; rife.enabled && rife.loaded; interpolation live.
+//   DEFERRED — engine compiling on the background worker; passthrough (no interp) until
+//              cached; build_plan must return 0 (c->log carries the build marker).
+//   DISABLED — RIFE off (no model dir, invalid model code, or a load/shape error); the
+//              chain continues without interpolation. Never hard-errors the chain.
+enum RifeSetup { RIFE_LOADED, RIFE_DEFERRED, RIFE_DISABLED };
+static RifeSetup setup_rife(aji_ctx* c, const AjiChainConf* chain,
+                            int src_w, int src_h, int cw, int ch,
+                            double /*fps*/, std::string& steps_log) {
+    // Reconfigure-safe: drop any prior RIFE engine/buffers before reconfiguring.
+    c->rife.reset();
+
+    // 1. Geometry — RIFE compiles at the SOURCE shape when before_upscale (interpolate
+    // then upscale every frame), else at the chain-output shape.
+    int rw = chain->rife_before_upscale ? src_w : cw;
+    int rh = chain->rife_before_upscale ? src_h : ch;
+    c->rife.g = rife_cpu::geometry(rw, rh);
+    const int pw = c->rife.g.pw, ph = c->rife.g.ph;
+
+    // 2. Model name. Invalid code or no model dir -> disable (chain continues, no interp).
+    std::string name = rife_cpu::model_name(chain->rife_model, chain->rife_ensemble);
+    if (name.empty() || c->rife_model_dir.empty()) {
+        steps_log += "(RIFE disabled: " +
+                     std::string(name.empty() ? "invalid rife_model code" : "no rife_model_dir") +
+                     "); ";
+        c->rife.enabled = false;
+        return RIFE_DISABLED;
+    }
+    const std::string onnx = c->rife_model_dir + "/" + name + ".onnx";
+
+    // 3. Async-build cascade (mirror ensure_model): an uncached RIFE engine compiles on
+    // the single background build slot; the chain runs passthrough (no interp) meanwhile.
+    if (c->async_build && !mxr_cached(onnx, pw, ph, 11)) {
+        const std::string key = mxr_cache_path(onnx, pw, ph, 11);
+        char res[32]; snprintf(res, sizeof res, "%dx%d", pw, ph);
+        if (c->failed_builds.count(key)) {
+            c->log = "MIGraphX engine build FAILED for " + name + " for " + res +
+                     "; playing without interpolation";
+            // A failed RIFE build degrades to no-interp passthrough, not a deferred
+            // reconfigure: treat as DISABLED so build_plan keeps building the chain.
+            c->rife.enabled = false;
+            return RIFE_DISABLED;
+        }
+        bool building = c->build && c->build->done.load() == 0;
+        if (!building) start_async_build(c, onnx, pw, ph, 11);
+        c->log = "Building MIGraphX engine for " + name + " for " + res +
+                 " (first play at this resolution)";
+        // before_upscale is set now (not just at LOAD) so aji_rife_before_upscale reports
+        // the right value even while deferred; factor still returns 0 until loaded.
+        c->rife.before_upscale = chain->rife_before_upscale;
+        c->rife.enabled = true; c->rife.loaded = false;
+        return RIFE_DEFERRED;
+    }
+
+    // 4. Cached (or sync build inline): load the RIFE engine. load_model hard-asserts the
+    // {1,11,ph,pw} input / {1,3,ph,pw} output shapes for channels==11.
+    auto m = load_model(c, onnx, pw, ph, 11);
+    if (!m) {
+        logmsg(c, 2, c->err.c_str());
+        steps_log += "(RIFE disabled: engine load failed); ";
+        c->rife.enabled = false;
+        return RIFE_DISABLED;
+    }
+    c->rife.model = std::move(m);
+
+    // 5. Pinned host staging (fp16). The eval binds the model's own param device
+    // buffers (see aji_infer_rife), so no separate device tensors are needed here.
+    const size_t plane = (size_t)pw * ph;
+    c->rife.pin_in.get(11 * plane);
+    c->rife.pin_out.get(3 * plane);
+
+    // 6. Host const template: ch7-10 (mesh/multiplier) filled once; A9 reuses this per
+    // frame and writes ch0-6 (frames + timestep) on top.
+    c->rife.assembly.assign(11 * plane, 0.f);
+    rife_cpu::fill_consts(c->rife.assembly.data(), pw, ph);
+
+    // 7. Carry chain config into the runtime state and mark live.
+    c->rife.num = chain->rife_factor_num;
+    c->rife.den = chain->rife_factor_den;
+    c->rife.scd_threshold = chain->rife_scd_threshold;
+    c->rife.before_upscale = chain->rife_before_upscale;
+    c->rife.enabled = true;
+    c->rife.loaded = true;
+
+    steps_log += "RIFE " + name + " " + std::to_string(chain->rife_factor_num) + "/" +
+                 std::to_string(chain->rife_factor_den) + " interp at " +
+                 std::to_string(rw) + "x" + std::to_string(rh) + " (padded " +
+                 std::to_string(pw) + "x" + std::to_string(ph) + ", " +
+                 (chain->rife_before_upscale ? "pre-upscale" : "post-upscale") + "); ";
+    return RIFE_LOADED;
 }
 
 // Build the step plan for the active chain (conf mode) or single model (direct).
@@ -586,6 +759,10 @@ static int build_plan(aji_ctx* c, int w, int h, double fps) {
     c->steps.clear();
     c->chain_scale = 0;
     c->gpu_color_eligible = false;
+    // Drop any prior RIFE state up front so a reconfigure that removes RIFE (direct mode,
+    // no chain, or a chain without rife=) doesn't leak a stale engine/buffers. setup_rife
+    // re-enables it (and re-resets) when the new chain requests RIFE.
+    c->rife.reset();
     int cw = w, ch = h;
 
     if (!c->conf_mode) {
@@ -656,7 +833,20 @@ static int build_plan(aji_ctx* c, int w, int h, double fps) {
             c->chain_scale = c->chain_scale ? c->chain_scale * sc : sc;
             steps_log += "model " + m.name + " " + std::to_string(sc) + "x -> " + std::to_string(cw) + "x" + std::to_string(ch) + "; ";
         }
-        if (chain->rife) steps_log += "(RIFE requested — not yet supported in aji_rocm); ";
+        // RIFE runs BEFORE the c->active computation below so a RIFE-only chain (zero
+        // upscale models, steps empty -> active=false) still configures interpolation.
+        if (chain->rife) {
+            RifeSetup rs = setup_rife(c, chain, w, h, cw, ch, fps, steps_log);
+            if (rs == RIFE_DEFERRED) {
+                // RIFE engine compiling in the background (c->log carries the build
+                // marker). Mirror the upscale defer at :719-720: passthrough, no active,
+                // until aji_poll() triggers a reconfigure that finds the cached .mxr.
+                c->steps.clear(); c->models.clear();
+                c->in_w = w; c->in_h = h; c->out_w = w; c->out_h = h; c->active = false;
+                return 0;
+            }
+            // LOADED or DISABLED: fall through and finish the plan normally.
+        }
         char hdr[160];
         snprintf(hdr, sizeof hdr, "slot %d chain %d: %dx%d -> %dx%d  [", c->slot, chain->index, w, h, cw, ch);
         c->log = std::string(hdr) + steps_log + "]";
@@ -709,17 +899,22 @@ static int run_chain(aji_ctx* c, RgbMat& rgb_in, RgbMat& rgb_out, std::string* e
                     pp.add(p.name.c_str(), migraphx::argument(sh, p.dev));
                 }
                 auto _ge = std::chrono::steady_clock::now();
-                auto outs = nm->prog.eval(pp);   // run the inference graph (MIGraphX API, not code-eval)
-                hipDeviceSynchronize();           // eval is async on the GPU stream; wait before D2H
+                migraphx::argument outs_arg;
+                {
+                    std::lock_guard<std::mutex> lk(c->gpu_eval_mtx);
+                    auto outs = nm->prog.eval(pp);   // run the inference graph (MIGraphX API, not code-eval)
+                    hipDeviceSynchronize();           // eval is async on the GPU stream; wait before D2H
+                    outs_arg = outs[0];
+                }
                 if (getenv("AJI_ROCM_TIMING")) { static double te=0; static long ne=0;
                     te += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_ge).count();
                     if (++ne % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/eval] eval+sync=%.1fms\n", te/ne); }
-                auto osh = outs[0].get_shape().lengths();
+                auto osh = outs_arg.get_shape().lengths();
                 if (osh.size() < 4) { if (errmsg) *errmsg = "bad output rank"; return AJI_ERR_SHAPE; }
                 const int OW = (int)osh[3], OH = (int)osh[2];
                 half_t* od = c->scratch.mdl_out.get((size_t)3 * OW * OH);
                 if (!od) { if (errmsg) *errmsg = "pinned host alloc failed (out)"; return AJI_ERR; }
-                if (hipMemcpy(od, outs[0].data(), nm->out_bytes, hipMemcpyDeviceToHost) != hipSuccess) {
+                if (hipMemcpy(od, outs_arg.data(), nm->out_bytes, hipMemcpyDeviceToHost) != hipSuccess) {
                     if (errmsg) *errmsg = "hipMemcpy D2H failed"; return AJI_ERR;
                 }
                 alt->create(OW, OH, 3);
@@ -802,49 +997,57 @@ static int run_chain_gpu(aji_ctx* c, RgbMat& rgb_in, const aji_frame* out,
             pp.add(p.name.c_str(), migraphx::argument(sh, p.dev));
         }
         auto _ge = std::chrono::steady_clock::now();
-        auto outs = nm->prog.eval(pp);   // inference graph (MIGraphX), not code-eval
-        if (hipDeviceSynchronize() != hipSuccess) { if (errmsg) *errmsg = "eval sync failed"; return AJI_ERR; }
-        if (getenv("AJI_ROCM_TIMING")) { static double te=0; static long ne=0;
-            te += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_ge).count();
-            if (++ne % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/eval] eval+sync=%.1fms\n", te/ne); }
-        auto oshape = outs[0].get_shape();
-        auto osh = oshape.lengths();
-        if (osh.size() < 4) { if (errmsg) *errmsg = "bad output rank"; return AJI_ERR_SHAPE; }
-        const int OW = (int)osh[3], OH = (int)osh[2];
-        if (OW != c->out_w || OH != c->out_h) { if (errmsg) *errmsg = "gpu-color out dims mismatch"; return AJI_ERR_SHAPE; }
-        if (getenv("AJI_ROCM_GPU_COLOR_DEBUG")) {
-            static bool once = false;
-            if (!once) { once = true;
-                auto st = oshape.strides();
-                fprintf(stderr, "[gpucolor] out lengths={%zu,%zu,%zu,%zu} strides={",
-                        osh[0],osh[1],osh[2],osh[3]);
-                for (auto s : st) fprintf(stderr, "%zu,", s);
-                fprintf(stderr, "} bytes=%zu  packedWHx3=%zu\n", oshape.bytes(), (size_t)3*OW*OH*2);
+        int OW = 0, OH = 0;
+        {
+            std::lock_guard<std::mutex> lk(c->gpu_eval_mtx);
+            // eval→gpu-out-color→final sync all on the default stream: one lock covers both.
+            auto outs = nm->prog.eval(pp);   // inference graph (MIGraphX), not code-eval
+            if (hipDeviceSynchronize() != hipSuccess) { if (errmsg) *errmsg = "eval sync failed"; return AJI_ERR; }
+            if (getenv("AJI_ROCM_TIMING")) { static double te=0; static long ne=0;
+                te += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_ge).count();
+                if (++ne % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/eval] eval+sync=%.1fms\n", te/ne); }
+            auto oshape = outs[0].get_shape();
+            auto osh = oshape.lengths();
+            if (osh.size() < 4) { if (errmsg) *errmsg = "bad output rank"; return AJI_ERR_SHAPE; }
+            OW = (int)osh[3]; OH = (int)osh[2];
+            if (OW != c->out_w || OH != c->out_h) { if (errmsg) *errmsg = "gpu-color out dims mismatch"; return AJI_ERR_SHAPE; }
+            if (getenv("AJI_ROCM_GPU_COLOR_DEBUG")) {
+                static bool once = false;
+                if (!once) { once = true;
+                    auto st = oshape.strides();
+                    fprintf(stderr, "[gpucolor] out lengths={%zu,%zu,%zu,%zu} strides={",
+                            osh[0],osh[1],osh[2],osh[3]);
+                    for (auto s : st) fprintf(stderr, "%zu,", s);
+                    fprintf(stderr, "} bytes=%zu  packedWHx3=%zu\n", oshape.bytes(), (size_t)3*OW*OH*2);
+                }
             }
+            if (!gpu_color_ensure(c, OW, OH, ofmt, omat, orng)) { if (errmsg) *errmsg = "gpu color setup failed"; return AJI_ERR; }
+            GpuColor& gc = c->gc;
+            if (const char* dp = getenv("AJI_ROCM_DUMP")) {   // debug: dump model in/out fp16 to isolate non-determinism
+                std::string pin = std::string(dp) + ".in", pout = std::string(dp) + ".out";
+                FILE* fi = fopen(pin.c_str(), "wb"); if (fi) { fwrite(ib, sizeof(half_t), n, fi); fclose(fi); }
+                std::vector<half_t> ob((size_t)3 * OW * OH);
+                hipMemcpy(ob.data(), outs[0].data(), ob.size() * sizeof(half_t), hipMemcpyDeviceToHost);
+                FILE* fo = fopen(pout.c_str(), "wb"); if (fo) { fwrite(ob.data(), sizeof(half_t), ob.size(), fo); fclose(fo); }
+            }
+            auto _gc = std::chrono::steady_clock::now();
+            aji_gpu_out_color(outs[0].data(), OW, OH, gc.csp,
+                gc.ph_start, gc.ph_wt, gc.ph_taps, gc.pv_start, gc.pv_wt, gc.pv_taps,
+                gc.Un, gc.Vn, gc.hu, gc.hv, gc.yplane, gc.uvplane, nullptr);
+            if (hipDeviceSynchronize() != hipSuccess) { if (errmsg) *errmsg = "gpu out-color failed"; return AJI_ERR; }
+            if (getenv("AJI_ROCM_TIMING")) { static double tg=0; static long ng=0;
+                tg += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_gc).count();
+                if (++ng % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/gpucolor] out-color+D2H=%.1fms\n", tg/ng); }
+        }  // gpu_eval_mtx released here; D2H copies below use c->gc.yplane/c->gc.uvplane (stable)
+        {
+            GpuColor& gc = c->gc;
+            const int cw = OW >> 1, ch = OH >> 1;
+            const int bytes = gc.csp.is_p010 ? 2 : 1;
+            ptrdiff_t ys  = out->stride[0] ? out->stride[0] : (ptrdiff_t)OW * bytes;
+            ptrdiff_t uvs = out->stride[1] ? out->stride[1] : (ptrdiff_t)cw * 2 * bytes;
+            if (hipMemcpy2D(out->plane[0], ys, gc.yplane, (size_t)OW*bytes, (size_t)OW*bytes, OH, hipMemcpyDeviceToHost) != hipSuccess) { if (errmsg) *errmsg = "D2H Y failed"; return AJI_ERR; }
+            if (hipMemcpy2D(out->plane[1], uvs, gc.uvplane, (size_t)cw*2*bytes, (size_t)cw*2*bytes, ch, hipMemcpyDeviceToHost) != hipSuccess) { if (errmsg) *errmsg = "D2H UV failed"; return AJI_ERR; }
         }
-        if (!gpu_color_ensure(c, OW, OH, ofmt, omat, orng)) { if (errmsg) *errmsg = "gpu color setup failed"; return AJI_ERR; }
-        GpuColor& gc = c->gc;
-        if (const char* dp = getenv("AJI_ROCM_DUMP")) {   // debug: dump model in/out fp16 to isolate non-determinism
-            std::string pin = std::string(dp) + ".in", pout = std::string(dp) + ".out";
-            FILE* fi = fopen(pin.c_str(), "wb"); if (fi) { fwrite(ib, sizeof(half_t), n, fi); fclose(fi); }
-            std::vector<half_t> ob((size_t)3 * OW * OH);
-            hipMemcpy(ob.data(), outs[0].data(), ob.size() * sizeof(half_t), hipMemcpyDeviceToHost);
-            FILE* fo = fopen(pout.c_str(), "wb"); if (fo) { fwrite(ob.data(), sizeof(half_t), ob.size(), fo); fclose(fo); }
-        }
-        auto _gc = std::chrono::steady_clock::now();
-        aji_gpu_out_color(outs[0].data(), OW, OH, gc.csp,
-            gc.ph_start, gc.ph_wt, gc.ph_taps, gc.pv_start, gc.pv_wt, gc.pv_taps,
-            gc.Un, gc.Vn, gc.hu, gc.hv, gc.yplane, gc.uvplane, nullptr);
-        if (hipDeviceSynchronize() != hipSuccess) { if (errmsg) *errmsg = "gpu out-color failed"; return AJI_ERR; }
-        const int cw = OW >> 1, ch = OH >> 1;
-        const int bytes = gc.csp.is_p010 ? 2 : 1;
-        ptrdiff_t ys  = out->stride[0] ? out->stride[0] : (ptrdiff_t)OW * bytes;
-        ptrdiff_t uvs = out->stride[1] ? out->stride[1] : (ptrdiff_t)cw * 2 * bytes;
-        if (hipMemcpy2D(out->plane[0], ys, gc.yplane, (size_t)OW*bytes, (size_t)OW*bytes, OH, hipMemcpyDeviceToHost) != hipSuccess) { if (errmsg) *errmsg = "D2H Y failed"; return AJI_ERR; }
-        if (hipMemcpy2D(out->plane[1], uvs, gc.uvplane, (size_t)cw*2*bytes, (size_t)cw*2*bytes, ch, hipMemcpyDeviceToHost) != hipSuccess) { if (errmsg) *errmsg = "D2H UV failed"; return AJI_ERR; }
-        if (getenv("AJI_ROCM_TIMING")) { static double tg=0; static long ng=0;
-            tg += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_gc).count();
-            if (++ng % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/gpucolor] out-color+D2H=%.1fms\n", tg/ng); }
     } catch (const std::exception& e) {
         if (errmsg) *errmsg = std::string("gpu chain failed: ") + e.what(); return AJI_ERR;
     }
@@ -910,6 +1113,8 @@ AJI_EXPORT aji_ctx* aji_create(const aji_create_params* p) {
     c->nthreads = std::max(1, std::min(8, omp_get_max_threads()));
     c->nthreads_max = std::max(1, omp_get_max_threads());
 #endif
+
+    if (p->rife_model_dir) c->rife_model_dir = p->rife_model_dir;
 
     if (p->conf_path && p->conf_path[0]) {
         c->conf_mode = true;
@@ -1109,8 +1314,17 @@ AJI_EXPORT int aji_wait(aji_ctx* c, uint64_t ticket) {
 
 AJI_EXPORT const char* aji_current_log(aji_ctx* c) { return c ? c->log.c_str() : ""; }
 AJI_EXPORT int aji_scale_factor(aji_ctx* c) { return c ? c->chain_scale : 0; }
-AJI_EXPORT int aji_rife_factor(aji_ctx*, int*, int*) { return 0; }
-AJI_EXPORT int aji_rife_before_upscale(aji_ctx*) { return 1; }  // moot: aji_rocm has no RIFE
+// 0 (no interpolation) until the RIFE .mxr is actually loaded — the filter only calls
+// aji_infer_rife when this returns 1, so it must stay 0 while the engine compiles.
+AJI_EXPORT int aji_rife_factor(aji_ctx* c, int* num, int* den) {
+    if (!c || !c->rife.enabled || !c->rife.loaded) return 0;
+    if (num) *num = c->rife.num;
+    if (den) *den = c->rife.den;
+    return 1;
+}
+AJI_EXPORT int aji_rife_before_upscale(aji_ctx* c) {
+    return (c && c->rife.enabled && c->rife.before_upscale) ? 1 : 0;
+}
 // Returns 1 exactly once when a background engine compile has finished (success or
 // failure); the filter then re-runs aji_configure, which finds the now-cached engine
 // (or, on failure, the failed-set marker -> passthrough). 0 if no build, still running,
@@ -1125,10 +1339,154 @@ AJI_EXPORT int aji_poll(aji_ctx* c) {
     return 1;
 }
 
-AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame*, const aji_frame*, double,
-                              const aji_frame*, void*) {
-    if (c) c->err = "RIFE not supported in aji_rocm yet (P7)";
-    return AJI_ERR;
+// Per-frame RIFE interpolation (4:2:0, SYNCHRONOUS). Produces the frame at timestep
+// `t in (0,1)` between A and B. The `stream` arg is NULL on the sw path and ignored —
+// aji_rocm always syncs on its own eval before returning. Returns:
+//   AJI_OK         — `out` written (interpolated frame).
+//   AJI_SCENE      — scene change detected; `out` left UNTOUCHED (caller duplicates A).
+//   AJI_ERR_FORMAT / AJI_ERR_SHAPE / AJI_ERR — invalid input or eval failure.
+// Color is forced BT.709 inside rife_cpu (range follows the source); the eval binding
+// mirrors run_chain (bind the MODEL's own params[].dev device buffers).
+AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame* a, const aji_frame* b,
+                              double t, const aji_frame* out, void* /*stream*/) {
+    if (!c || !c->rife.loaded) { if (c) c->err = "rife not loaded"; return AJI_ERR; }
+    auto& R = c->rife;
+
+    // 1. Validate: formats equal and 4:2:0; dims equal the RIFE geometry's source w x h.
+    if (a->format != b->format || a->format != out->format) {
+        c->err = "rife fmt mismatch"; return AJI_ERR_FORMAT;
+    }
+    if (a->format != AJI_FMT_NV12 && a->format != AJI_FMT_P010) {
+        c->err = "rife needs nv12/p010"; return AJI_ERR_FORMAT;
+    }
+    if (a->width != R.g.w || a->height != R.g.h ||
+        b->width != R.g.w || b->height != R.g.h ||
+        out->width != R.g.w || out->height != R.g.h) {
+        c->err = "rife dim mismatch"; return AJI_ERR_SHAPE;
+    }
+
+    const int pw = R.g.pw, ph = R.g.ph;
+    const size_t plane = (size_t)pw * ph;
+
+    // --- env-gated per-phase profiling (AJI_RIFE_PROFILE=1) -------------------
+    // All timing state is function-local static; completely inert unless the env var is set.
+    // Phases: scene_detect | color_pre | tensor_cast | h2d | eval_sync | d2h | fp16_out | color_post
+    static const bool s_prof = (getenv("AJI_RIFE_PROFILE") != nullptr);
+    using clk = std::chrono::steady_clock;
+    using dur = std::chrono::duration<double, std::milli>;
+    static double s_acc[8]  = {};
+    static long   s_calls   = 0;
+    clk::time_point tp[9];   // 9 fence-points for 8 intervals
+    if (s_prof) tp[0] = clk::now();
+
+    // 2. Scene detect on the UNPADDED luma (plane[0]), raw container values. norm scales
+    // the container range; divisor (pw*ph) is the PADDED area (in the helper). A scene
+    // change skips interpolation: return AJI_SCENE with `out` untouched (caller dups A).
+    const double norm = (a->format == AJI_FMT_P010) ? 1.0 / 65472.0 : 1.0 / 255.0;
+    bool scene;
+    if (a->format == AJI_FMT_P010) {
+        scene = rife_cpu::scene_detect((const uint16_t*)a->plane[0], a->stride[0],
+                                       (const uint16_t*)b->plane[0], b->stride[0],
+                                       R.g.w, R.g.h, pw, ph, norm, R.scd_threshold);
+    } else {
+        scene = rife_cpu::scene_detect((const uint8_t*)a->plane[0], a->stride[0],
+                                       (const uint8_t*)b->plane[0], b->stride[0],
+                                       R.g.w, R.g.h, pw, ph, norm, R.scd_threshold);
+    }
+    if (s_prof) tp[1] = clk::now();
+    if (scene) return AJI_SCENE;
+
+    // 3. Assemble the 11-ch fp32 tensor. Consts (ch7-10) are already in R.assembly (set
+    // once by setup_rife). A -> ch0-2, B -> ch3-5 (BT.709 + bilinear chroma upsample,
+    // centered into pw x ph with black borders); ch6 <- the timestep plane.
+    rife_cpu::yuv420_to_rgb_planes(*a, R.g, R.assembly.data(), 0, (aji_range)a->range);
+    rife_cpu::yuv420_to_rgb_planes(*b, R.g, R.assembly.data(), 1, (aji_range)a->range);
+    float* ch6 = R.assembly.data() + 6 * plane;
+    for (size_t i = 0; i < plane; ++i) ch6[i] = (float)t;   // (_Float16)t below = RNE, TRT parity
+    if (s_prof) tp[2] = clk::now();
+
+    // 4. fp32 -> fp16 the full 11-ch tensor into pinned host staging.
+    half_t* hin = R.pin_in.get(11 * plane);
+    if (!hin) { c->err = "rife pinned host alloc failed (in)"; return AJI_ERR; }
+    const float* ab = R.assembly.data();
+    const long nin = (long)(11 * plane);
+    #pragma omp parallel for schedule(static) num_threads(color_nt(c, nin))
+    for (long i = 0; i < nin; ++i) hin[i] = (half_t)ab[i];
+    if (s_prof) tp[3] = clk::now();
+
+    // 5. H2D into the model's input param; eval + device sync under gpu_eval_mtx (the
+    // upscale worker shares the device-wide sync). Bind every param's device buffer with
+    // its fp16 shape, exactly like run_chain. Capture outs[0] inside the lock; D2H after.
+    MgxModel* nm = R.model.get();
+    migraphx::argument outs_arg;
+    try {
+        migraphx::program_parameters pp;
+        for (auto& p : nm->params) {
+            if (p.is_input) {
+                if (hipMemcpy(p.dev, hin, p.bytes, hipMemcpyHostToDevice) != hipSuccess) {
+                    c->err = "rife hipMemcpy H2D failed"; return AJI_ERR;
+                }
+            }
+            migraphx::shape sh(migraphx_shape_half_type, p.dims);
+            pp.add(p.name.c_str(), migraphx::argument(sh, p.dev));
+        }
+        if (s_prof) tp[4] = clk::now();
+        {
+            std::lock_guard<std::mutex> lk(c->gpu_eval_mtx);
+            auto outs = nm->prog.eval(pp);     // run the RIFE graph (MIGraphX API, not code-eval)
+            hipDeviceSynchronize();            // eval is async on the GPU stream; wait before D2H
+            outs_arg = outs[0];
+        }
+    } catch (const std::exception& e) {
+        c->err = std::string("rife eval failed: ") + e.what(); return AJI_ERR;
+    }
+    if (s_prof) tp[5] = clk::now();
+
+    // 6. D2H the 3-ch output into pinned host staging, fp16 -> fp32, then crop the centered
+    // w x h window into `out` (BT.709 RGB->YUV + bilinear chroma downsample, range follows A).
+    half_t* hout = R.pin_out.get(3 * plane);
+    if (!hout) { c->err = "rife pinned host alloc failed (out)"; return AJI_ERR; }
+    if (hipMemcpy(hout, outs_arg.data(), nm->out_bytes, hipMemcpyDeviceToHost) != hipSuccess) {
+        c->err = "rife hipMemcpy D2H failed"; return AJI_ERR;
+    }
+    if (s_prof) tp[6] = clk::now();
+
+    std::vector<float> rgb(3 * plane);
+    const long nout = (long)(3 * plane);
+    #pragma omp parallel for schedule(static) num_threads(color_nt(c, nout))
+    for (long i = 0; i < nout; ++i) rgb[i] = (float)hout[i];
+    if (s_prof) tp[7] = clk::now();
+
+    rife_cpu::rgb_planes_to_yuv420(rgb.data(), R.g, *(aji_frame*)out, (aji_range)a->range);
+    if (s_prof) tp[8] = clk::now();
+
+    // Accumulate phase durations and print a breakdown every 50 calls.
+    if (s_prof) {
+        // Phases: [0]=scene_detect [1]=color_pre [2]=tensor_ch6+cast [3]=h2d_param_bind
+        //         [4]=eval_sync    [5]=d2h       [6]=fp16_out_cast   [7]=color_post
+        // Note: tp[3]->tp[4] = H2D + param bind (hipMemcpy H2D is inside the params loop);
+        //       tp[4]->tp[5] = eval + hipDeviceSynchronize (GPU wall-clock).
+        for (int i = 0; i < 8; ++i)
+            s_acc[i] += dur(tp[i+1] - tp[i]).count();
+        ++s_calls;
+        if (s_calls % 50 == 0) {
+            static const char* names[8] = {
+                "scene_detect", "color_pre", "tensor_ch6+cast(fp32->fp16)",
+                "h2d+param_bind", "eval+sync(GPU)", "d2h",
+                "fp16_out_cast", "color_post"
+            };
+            double total = 0;
+            for (int i = 0; i < 8; ++i) total += s_acc[i];
+            fprintf(stderr, "[rife-prof] --- call %ld ---\n", s_calls);
+            for (int i = 0; i < 8; ++i)
+                fprintf(stderr, "[rife-prof] %s: %.3f ms\n",
+                        names[i], s_acc[i] / s_calls);
+            fprintf(stderr, "[rife-prof] TOTAL: %.3f ms  (calls=%ld)\n",
+                    total / s_calls, s_calls);
+        }
+    }
+
+    return AJI_OK;
 }
 
 AJI_EXPORT const char* aji_last_error(aji_ctx* c) { return c ? c->err.c_str() : "null ctx"; }

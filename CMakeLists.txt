@@ -152,6 +152,12 @@ target_include_directories(aji_kernel_test PRIVATE include src)
 target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)
 endif()
 
+# RIFE self-test harness: standalone CPU unit tests (no GPU required).
+add_executable(rife_selftest src/rife_selftest.cpp src/rife_cpu.cpp)
+target_include_directories(rife_selftest PRIVATE src include)
+# rife_cpu.cpp pulls resample.h which uses f16c/AVX intrinsics; match aji_rocm's CXX flags.
+target_compile_options(rife_selftest PRIVATE -mf16c -mavx2 -mfma)
+
 # The ncnn-Vulkan backend (aji_vk) is retired: ~7-9x slower than MIGraphX on these
 # models, so it didn't stand up as the AMD path. aji_rocm (below) replaces it; NVIDIA
 # on Linux is served by aji_trt (TensorRT).
@@ -179,7 +185,9 @@ if(AJI_MIGRAPHX_LIB AND AJI_HIP_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraph
                 -DVAR=AJI_ROCM_COLOR_SRC -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake
         DEPENDS ${AJI_COLOR_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake
         COMMENT "Embedding aji_rocm_color device source")
-    add_library(aji_rocm SHARED src/aji_rocm.cpp src/aji_rocm_color.cpp src/aji_conf.cpp ${AJI_COLOR_GEN})
+    # rife_cpu.cpp (RIFE CPU color/scene/geometry) joins the library; the device color
+    # is JIT (hipRTC), so there is no enable_language(HIP) / gfx arch list.
+    add_library(aji_rocm SHARED src/aji_rocm.cpp src/aji_rocm_color.cpp src/aji_conf.cpp src/rife_cpu.cpp ${AJI_COLOR_GEN})
     target_include_directories(aji_rocm
         PUBLIC include
         PRIVATE src ${CMAKE_CURRENT_BINARY_DIR}/gen "${AJI_ROCM_ROOT}/include")
@@ -207,6 +215,31 @@ if(AJI_MIGRAPHX_LIB AND AJI_HIP_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraph
     if(OpenMP_CXX_FOUND)
         target_link_libraries(aji_rocm_color_test PRIVATE OpenMP::OpenMP_CXX)
     endif()
+
+    # RIFE end-to-end gate (tasks A8/A9): links libaji_rocm.so, drives the engine
+    # through a RIFE-only conf chain, waits for the first-run compile, and asserts
+    # the engine loads, aji_rife_factor reports the configured factor, aji_infer_rife
+    # interpolates a valid frame, and a hard cut returns AJI_SCENE. Host frames only
+    # (aji_rocm planes are host pointers) so it needs no resample.h / f16c flags.
+    add_executable(rife_harness test/rife_harness.cpp)
+    target_include_directories(rife_harness PRIVATE include src)
+    target_link_libraries(rife_harness PRIVATE aji_rocm)
+
+    # Clean engine-level RIFE+upscale pipeline benchmark: one chain that BOTH
+    # upscales (2x SD Compact) AND interpolates (rife_v4.26, before_upscale), driven
+    # exactly like the player's filter (aji_infer_rife + aji_infer/aji_wait), to
+    # characterize "RIFE 2x at 480p" output fps without mpv noise.
+    add_executable(rife_pipeline_bench test/rife_pipeline_bench.cpp)
+    target_include_directories(rife_pipeline_bench PRIVATE include src)
+    target_link_libraries(rife_pipeline_bench PRIVATE aji_rocm)
+
+    # rocm_rife_transcode: minimal OFFLINE RIFE+upscale transcode FILTER. Reuses
+    # rife_pipeline_bench's conf/create/configure + RIFE-first flow, but reads raw
+    # NV12 from stdin and writes upscaled NV12 to stdout (ffmpeg does decode+encode
+    # around it) — the ROCm replacement for the CUDA-only aji_encode CLI.
+    add_executable(rocm_rife_transcode test/rocm_rife_transcode.cpp)
+    target_include_directories(rocm_rife_transcode PRIVATE include src)
+    target_link_libraries(rocm_rife_transcode PRIVATE aji_rocm)
 else()
     message(STATUS "MIGraphX (${AJI_ROCM_ROOT} libmigraphx_c) not found; skipping aji_rocm.")
 endif()
