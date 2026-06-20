@@ -252,14 +252,6 @@ int main(int argc, char **argv) {
         aji_destroy(&c); return FAIL("output dims not a positive integer multiple of source");
     }
     if (!no_rife && (num < 1 || den < 1)) { aji_destroy(&c); return FAIL("rife factor invalid"); }
-    // Integer factors only: the step loop below uses steps = num/den, so a rational
-    // factor (e.g. 5/2) would silently truncate to a 2x stream with the wrong frame
-    // count and an fps that no longer matches the downstream -r. Fail loudly, matching
-    // the reference offline encoder (src/encode.c rejects rden != 1 || rnum % rden != 0).
-    if (!no_rife && (den != 1 || num % den != 0)) {
-        aji_destroy(&c);
-        return FAIL("rational RIFE factor (den != 1) not supported; integer factors only");
-    }
 
     const int IN_FD = 0, OUT_FD = 1;
 
@@ -322,7 +314,6 @@ int main(int argc, char **argv) {
         };
 
         Frame *prev = &srcA, *cur = &srcB;
-        const int steps = num / den;
         while (true) {
             Frame *dst = (in_count == 0) ? prev : cur;
             int r = read_frame(*dst, in_count);
@@ -334,20 +325,26 @@ int main(int argc, char **argv) {
                 out_count++; in_count++;
                 continue;
             }
-            for (int k = 1; k < steps; k++) {
-                double t = (double)k / (double)steps;
-                int rr = aji_infer_rife(c, &prev->f, &cur->f, t, &interp.f, nullptr);
-                const aji_frame *interp_in = &interp.f;
-                if (rr == AJI_SCENE) { scene_skips++; interp_in = &prev->f; }
-                else if (rr != AJI_OK) {
-                    fprintf(stderr, "aji_infer_rife err %d: %s\n", rr, aji_last_error(c));
-                    aji_destroy(&c); return FAIL("rife infer (PRE)");
+            // Emit every output frame whose grid time o*den/num (o == out_count) lands in
+            // (in_count-1, in_count]. Integer factors give 1 interp + the real cur per pair;
+            // rational factors (e.g. 5/2 = 24->60) put the source frame on the grid only when
+            // its time is an exact grid point (every den-th frame), interpolating elsewhere.
+            while ((uint64_t)out_count * den <= (uint64_t)in_count * num) {
+                if ((uint64_t)out_count * den == (uint64_t)in_count * num) {
+                    if (upscale_and_emit(&cur->f) != 0) { aji_destroy(&c); return FAIL("emit cur (PRE)"); }
+                } else {
+                    double t = (double)((uint64_t)out_count * den - (uint64_t)(in_count - 1) * num) / (double)num;
+                    int rr = aji_infer_rife(c, &prev->f, &cur->f, t, &interp.f, nullptr);
+                    const aji_frame *interp_in = &interp.f;
+                    if (rr == AJI_SCENE) { scene_skips++; interp_in = &prev->f; }
+                    else if (rr != AJI_OK) {
+                        fprintf(stderr, "aji_infer_rife err %d: %s\n", rr, aji_last_error(c));
+                        aji_destroy(&c); return FAIL("rife infer (PRE)");
+                    }
+                    if (upscale_and_emit(interp_in) != 0) { aji_destroy(&c); return FAIL("emit interp (PRE)"); }
                 }
-                if (upscale_and_emit(interp_in) != 0) { aji_destroy(&c); return FAIL("emit interp (PRE)"); }
                 out_count++;
             }
-            if (upscale_and_emit(&cur->f) != 0) { aji_destroy(&c); return FAIL("emit cur (PRE)"); }
-            out_count++;
             in_count++;
             std::swap(prev, cur);
         }
@@ -361,7 +358,6 @@ int main(int argc, char **argv) {
                 src.total(), upA.total(), num, den);
 
         Frame *up_prev = &upA, *up_cur = &upB;
-        const int steps = num / den;
         while (true) {
             int r = read_frame(src, in_count);
             if (r == 0) break;
@@ -376,21 +372,23 @@ int main(int argc, char **argv) {
             }
             // later input -> up_cur = upscale(f).
             if (upscale(&src.f, *up_cur) != 0) { aji_destroy(&c); return FAIL("upscale cur (POST)"); }
-            for (int k = 1; k < steps; k++) {
-                double t = (double)k / (double)steps;
-                int rr = aji_infer_rife(c, &up_prev->f, &up_cur->f, t, &interp.f, nullptr);
-                const Frame *interp_in = &interp;
-                if (rr == AJI_SCENE) { scene_skips++; interp_in = up_prev; }   // emit dup of up_prev
-                else if (rr != AJI_OK) {
-                    fprintf(stderr, "aji_infer_rife err %d: %s\n", rr, aji_last_error(c));
-                    aji_destroy(&c); return FAIL("rife infer (POST)");
+            // Same grid stepping as PRE, but interpolate the UPSCALED pair at output res.
+            while ((uint64_t)out_count * den <= (uint64_t)in_count * num) {
+                if ((uint64_t)out_count * den == (uint64_t)in_count * num) {
+                    if (emit_frame(*up_cur) != 0) { aji_destroy(&c); return FAIL("emit cur (POST)"); }
+                } else {
+                    double t = (double)((uint64_t)out_count * den - (uint64_t)(in_count - 1) * num) / (double)num;
+                    int rr = aji_infer_rife(c, &up_prev->f, &up_cur->f, t, &interp.f, nullptr);
+                    const Frame *interp_in = &interp;
+                    if (rr == AJI_SCENE) { scene_skips++; interp_in = up_prev; }   // emit dup of up_prev
+                    else if (rr != AJI_OK) {
+                        fprintf(stderr, "aji_infer_rife err %d: %s\n", rr, aji_last_error(c));
+                        aji_destroy(&c); return FAIL("rife infer (POST)");
+                    }
+                    if (emit_frame(*interp_in) != 0) { aji_destroy(&c); return FAIL("emit interp (POST)"); }
                 }
-                if (emit_frame(*interp_in) != 0) { aji_destroy(&c); return FAIL("emit interp (POST)"); }
                 out_count++;
             }
-            // emit the real upscaled cur.
-            if (emit_frame(*up_cur) != 0) { aji_destroy(&c); return FAIL("emit cur (POST)"); }
-            out_count++;
             in_count++;
             std::swap(up_prev, up_cur);
         }
