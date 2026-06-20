@@ -227,6 +227,14 @@ if(AJI_MIGRAPHX_LIB AND AJI_HIP_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraph
     add_executable(rife_pipeline_bench test/rife_pipeline_bench.cpp)
     target_include_directories(rife_pipeline_bench PRIVATE include src)
     target_link_libraries(rife_pipeline_bench PRIVATE aji_rocm)
+
+    # rocm_rife_transcode: minimal OFFLINE RIFE+upscale transcode FILTER. Reuses
+    # rife_pipeline_bench's conf/create/configure + RIFE-first flow, but reads raw
+    # NV12 from stdin and writes upscaled NV12 to stdout (ffmpeg does decode+encode
+    # around it) — the ROCm replacement for the CUDA-only aji_encode CLI.
+    add_executable(rocm_rife_transcode test/rocm_rife_transcode.cpp)
+    target_include_directories(rocm_rife_transcode PRIVATE include src)
+    target_link_libraries(rocm_rife_transcode PRIVATE aji_rocm)
 else()
     message(STATUS "MIGraphX (${AJI_ROCM_ROOT} libmigraphx_c) not found; skipping aji_rocm.")
 endif()
