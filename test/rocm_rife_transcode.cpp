@@ -252,6 +252,14 @@ int main(int argc, char **argv) {
         aji_destroy(&c); return FAIL("output dims not a positive integer multiple of source");
     }
     if (!no_rife && (num < 1 || den < 1)) { aji_destroy(&c); return FAIL("rife factor invalid"); }
+    // Integer factors only: the step loop below uses steps = num/den, so a rational
+    // factor (e.g. 5/2) would silently truncate to a 2x stream with the wrong frame
+    // count and an fps that no longer matches the downstream -r. Fail loudly, matching
+    // the reference offline encoder (src/encode.c rejects rden != 1 || rnum % rden != 0).
+    if (!no_rife && (den != 1 || num % den != 0)) {
+        aji_destroy(&c);
+        return FAIL("rational RIFE factor (den != 1) not supported; integer factors only");
+    }
 
     const int IN_FD = 0, OUT_FD = 1;
 
