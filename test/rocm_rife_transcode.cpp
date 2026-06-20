@@ -15,10 +15,16 @@
  * won't build on this AMD box, so this tool replaces it for ROCm: ffmpeg does
  * decode+encode around it; this filter is just engine glue.
  *
- *   ffmpeg ... -f rawvideo -pix_fmt <nv12|p010le> - \
+ *   ffmpeg -i IN -fps_mode passthrough -f rawvideo -pix_fmt <nv12|p010le> - \
  *     | rocm_rife_transcode --conf C --model-dir D --rife-model-dir R \
  *                           --format <nv12|p010le> [--slot N] W H FPS \
  *     | ffmpeg -f rawvideo -pix_fmt <nv12|p010le> -s OUTWxOUTH -r OUTFPS -i - ... OUT.mp4
+ *
+ * DECODE GOTCHA: pass -fps_mode passthrough on the input ffmpeg so it emits EVERY
+ * native frame in display order. Without it, a source whose container framerate is
+ * mislabeled (e.g. a 30fps OP tagged 23.976) is silently rate-converted on decode —
+ * frames are dropped and RIFE then interpolates across the gaps, baking periodic
+ * judder into the output. OUTFPS must equal FPS * num/den (the output ffmpeg's -r).
  *
  * stdin : raw NV12 (W*H*3/2 bytes) or P010LE (W*H*3 bytes) frames.
  * stdout: raw frames in the same pixel format at out_w x out_h, IN TIME ORDER.
