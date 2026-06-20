@@ -238,26 +238,17 @@ struct aji_ctx {
         int    num = 1, den = 1;
         double scd_threshold = 0.150;
         bool   before_upscale = true, enabled = false, loaded = false;
-        void*  dev_in = nullptr; void* dev_out = nullptr;     // 11*plane*2 / 3*plane*2 bytes
         PinnedHalf pin_in, pin_out;                            // dedicated pinned host fp16
         std::vector<float> assembly;                           // 11*plane fp32 (consts + per-frame)
-        // dedicated color scratch (resample plans + temp planes) added in A5 wiring
 
-        // Free the device tensors (the MgxModel and the pinned/assembly buffers free
-        // themselves via their own dtors). Called on reconfigure and from ~RifeState.
-        void free_dev() {
-            if (dev_in)  { hipFree(dev_in);  dev_in  = nullptr; }
-            if (dev_out) { hipFree(dev_out); dev_out = nullptr; }
-        }
-        // Reconfigure-safe reset: drop the model + device buffers and disable, so stale
-        // RIFE state never leaks across an aji_configure that changes/removes RIFE.
+        // Reconfigure-safe reset: drop the model + assembly and disable, so stale RIFE
+        // state never leaks across an aji_configure that changes/removes RIFE. The model,
+        // pinned, and assembly buffers free themselves via their own dtors.
         void reset() {
-            free_dev();
             model.reset();
             assembly.clear();
             enabled = loaded = false;
         }
-        ~RifeState() { free_dev(); }
     };
     RifeState rife;
     std::string rife_model_dir;
@@ -735,17 +726,9 @@ static RifeSetup setup_rife(aji_ctx* c, const AjiChainConf* chain,
     }
     c->rife.model = std::move(m);
 
-    // 5. Dedicated device tensors (fp16) + pinned host staging. free_dev was already
-    // called by reset() above, so no double-allocation.
+    // 5. Pinned host staging (fp16). The eval binds the model's own param device
+    // buffers (see aji_infer_rife), so no separate device tensors are needed here.
     const size_t plane = (size_t)pw * ph;
-    if (hipMalloc(&c->rife.dev_in,  11 * plane * 2) != hipSuccess || !c->rife.dev_in ||
-        hipMalloc(&c->rife.dev_out,  3 * plane * 2) != hipSuccess || !c->rife.dev_out) {
-        c->err = "RIFE: hipMalloc failed for device tensors";
-        logmsg(c, 2, c->err.c_str());
-        c->rife.reset();
-        steps_log += "(RIFE disabled: device alloc failed); ";
-        return RIFE_DISABLED;
-    }
     c->rife.pin_in.get(11 * plane);
     c->rife.pin_out.get(3 * plane);
 
@@ -1363,8 +1346,7 @@ AJI_EXPORT int aji_poll(aji_ctx* c) {
 //   AJI_SCENE      — scene change detected; `out` left UNTOUCHED (caller duplicates A).
 //   AJI_ERR_FORMAT / AJI_ERR_SHAPE / AJI_ERR — invalid input or eval failure.
 // Color is forced BT.709 inside rife_cpu (range follows the source); the eval binding
-// mirrors run_chain (bind the MODEL's params[].dev; the RifeState dev_in/dev_out are
-// Phase-B scaffolding and are left untouched here).
+// mirrors run_chain (bind the MODEL's own params[].dev device buffers).
 AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame* a, const aji_frame* b,
                               double t, const aji_frame* out, void* /*stream*/) {
     if (!c || !c->rife.loaded) { if (c) c->err = "rife not loaded"; return AJI_ERR; }
