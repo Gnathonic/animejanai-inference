@@ -1386,6 +1386,17 @@ AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame* a, const aji_frame* b
     const int pw = R.g.pw, ph = R.g.ph;
     const size_t plane = (size_t)pw * ph;
 
+    // --- env-gated per-phase profiling (AJI_RIFE_PROFILE=1) -------------------
+    // All timing state is function-local static; completely inert unless the env var is set.
+    // Phases: scene_detect | color_pre | tensor_cast | h2d | eval_sync | d2h | fp16_out | color_post
+    static const bool s_prof = (getenv("AJI_RIFE_PROFILE") != nullptr);
+    using clk = std::chrono::steady_clock;
+    using dur = std::chrono::duration<double, std::milli>;
+    static double s_acc[8]  = {};
+    static long   s_calls   = 0;
+    clk::time_point tp[9];   // 9 fence-points for 8 intervals
+    if (s_prof) tp[0] = clk::now();
+
     // 2. Scene detect on the UNPADDED luma (plane[0]), raw container values. norm scales
     // the container range; divisor (pw*ph) is the PADDED area (in the helper). A scene
     // change skips interpolation: return AJI_SCENE with `out` untouched (caller dups A).
@@ -1400,6 +1411,7 @@ AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame* a, const aji_frame* b
                                        (const uint8_t*)b->plane[0], b->stride[0],
                                        R.g.w, R.g.h, pw, ph, norm, R.scd_threshold);
     }
+    if (s_prof) tp[1] = clk::now();
     if (scene) return AJI_SCENE;
 
     // 3. Assemble the 11-ch fp32 tensor. Consts (ch7-10) are already in R.assembly (set
@@ -1409,6 +1421,7 @@ AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame* a, const aji_frame* b
     rife_cpu::yuv420_to_rgb_planes(*b, R.g, R.assembly.data(), 1, (aji_range)a->range);
     float* ch6 = R.assembly.data() + 6 * plane;
     for (size_t i = 0; i < plane; ++i) ch6[i] = (float)t;   // (_Float16)t below = RNE, TRT parity
+    if (s_prof) tp[2] = clk::now();
 
     // 4. fp32 -> fp16 the full 11-ch tensor into pinned host staging.
     half_t* hin = R.pin_in.get(11 * plane);
@@ -1417,6 +1430,7 @@ AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame* a, const aji_frame* b
     const long nin = (long)(11 * plane);
     #pragma omp parallel for schedule(static) num_threads(color_nt(c, nin))
     for (long i = 0; i < nin; ++i) hin[i] = (half_t)ab[i];
+    if (s_prof) tp[3] = clk::now();
 
     // 5. H2D into the model's input param; eval + device sync under gpu_eval_mtx (the
     // upscale worker shares the device-wide sync). Bind every param's device buffer with
@@ -1434,6 +1448,7 @@ AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame* a, const aji_frame* b
             migraphx::shape sh(migraphx_shape_half_type, p.dims);
             pp.add(p.name.c_str(), migraphx::argument(sh, p.dev));
         }
+        if (s_prof) tp[4] = clk::now();
         {
             std::lock_guard<std::mutex> lk(c->gpu_eval_mtx);
             auto outs = nm->prog.eval(pp);     // run the RIFE graph (MIGraphX API, not code-eval)
@@ -1443,6 +1458,7 @@ AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame* a, const aji_frame* b
     } catch (const std::exception& e) {
         c->err = std::string("rife eval failed: ") + e.what(); return AJI_ERR;
     }
+    if (s_prof) tp[5] = clk::now();
 
     // 6. D2H the 3-ch output into pinned host staging, fp16 -> fp32, then crop the centered
     // w x h window into `out` (BT.709 RGB->YUV + bilinear chroma downsample, range follows A).
@@ -1451,11 +1467,43 @@ AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame* a, const aji_frame* b
     if (hipMemcpy(hout, outs_arg.data(), nm->out_bytes, hipMemcpyDeviceToHost) != hipSuccess) {
         c->err = "rife hipMemcpy D2H failed"; return AJI_ERR;
     }
+    if (s_prof) tp[6] = clk::now();
+
     std::vector<float> rgb(3 * plane);
     const long nout = (long)(3 * plane);
     #pragma omp parallel for schedule(static) num_threads(color_nt(c, nout))
     for (long i = 0; i < nout; ++i) rgb[i] = (float)hout[i];
+    if (s_prof) tp[7] = clk::now();
+
     rife_cpu::rgb_planes_to_yuv420(rgb.data(), R.g, *(aji_frame*)out, (aji_range)a->range);
+    if (s_prof) tp[8] = clk::now();
+
+    // Accumulate phase durations and print a breakdown every 50 calls.
+    if (s_prof) {
+        // Phases: [0]=scene_detect [1]=color_pre [2]=tensor_ch6+cast [3]=h2d_param_bind
+        //         [4]=eval_sync    [5]=d2h       [6]=fp16_out_cast   [7]=color_post
+        // Note: tp[3]->tp[4] = H2D + param bind (hipMemcpy H2D is inside the params loop);
+        //       tp[4]->tp[5] = eval + hipDeviceSynchronize (GPU wall-clock).
+        for (int i = 0; i < 8; ++i)
+            s_acc[i] += dur(tp[i+1] - tp[i]).count();
+        ++s_calls;
+        if (s_calls % 50 == 0) {
+            static const char* names[8] = {
+                "scene_detect", "color_pre", "tensor_ch6+cast(fp32->fp16)",
+                "h2d+param_bind", "eval+sync(GPU)", "d2h",
+                "fp16_out_cast", "color_post"
+            };
+            double total = 0;
+            for (int i = 0; i < 8; ++i) total += s_acc[i];
+            fprintf(stderr, "[rife-prof] --- call %ld ---\n", s_calls);
+            for (int i = 0; i < 8; ++i)
+                fprintf(stderr, "[rife-prof] %s: %.3f ms\n",
+                        names[i], s_acc[i] / s_calls);
+            fprintf(stderr, "[rife-prof] TOTAL: %.3f ms  (calls=%ld)\n",
+                    total / s_calls, s_calls);
+        }
+    }
+
     return AJI_OK;
 }
 

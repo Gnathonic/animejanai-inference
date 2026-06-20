@@ -31,6 +31,7 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#include <chrono>
 
 #include <unistd.h>   // usleep
 
@@ -69,7 +70,7 @@ static const char *MODEL_DIR =
     "/home/nathan/AnimeJaNai-Linux/mpv-upscale-2x_animejanai-v0.4.3-linux/"
     "animejanai";
 
-static const int  W = 256, H = 256;          // already mod-64 -> pad 0, fast compile
+static const int  W = 640, H = 480;          // real case: 640x480 -> pads to 640x512 RIFE
 static const double FPS = 48.0;              // 2x -> source 24-ish; matches the chain
 static const double BUILD_TIMEOUT_S = 300.0; // first compile ~72s; generous headroom
 
@@ -306,6 +307,46 @@ int main(void) {
     printf("scene-cut PASS (AJI_SCENE)\n");
 
     printf("\nA9 PASS\n");
+
+    // -- warm benchmark at 640x480 (RIFE geometry: 640x512) -------------------
+    // Use the motion pair (A and B, 8px-shifted) so scene-detect returns false
+    // and real interpolation runs every call.  200 iterations: first few warm the
+    // GPU/JIT/OS; the average reflects steady-state.  [rife-prof] lines (if
+    // AJI_RIFE_PROFILE=1) interleave with this output and show per-phase detail.
+    printf("\n== WARM BENCHMARK: 640x480 -> RIFE 640x512, 200 iters ==\n");
+    {
+        static const int BENCH_ITERS = 200;
+        // Re-zero OUT for each call so we are sure it's being written.
+        NV12 bench_out; bench_out.alloc();
+        // Warm-up: 5 calls (pipeline, GPU state, pinned alloc)
+        for (int i = 0; i < 5; i++) {
+            std::memset(bench_out.y.data(), 0, bench_out.y.size());
+            std::memset(bench_out.uv.data(), 128, bench_out.uv.size());
+            int rc = aji_infer_rife(c, &A.f, &B.f, 0.5, &bench_out.f, nullptr);
+            if (rc != AJI_OK) {
+                fprintf(stderr, "bench warm-up call %d failed: %d %s\n",
+                        i, rc, aji_last_error(c));
+                aji_destroy(&c);
+                return FAIL("bench warm-up failed");
+            }
+        }
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < BENCH_ITERS; i++) {
+            int rc = aji_infer_rife(c, &A.f, &B.f, 0.5, &bench_out.f, nullptr);
+            if (rc != AJI_OK) {
+                fprintf(stderr, "bench iter %d failed: %d %s\n",
+                        i, rc, aji_last_error(c));
+                aji_destroy(&c);
+                return FAIL("bench iter failed");
+            }
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        double avg_ms   = total_ms / BENCH_ITERS;
+        printf("[bench] %d iters total=%.1f ms  avg=%.2f ms/call\n",
+               BENCH_ITERS, total_ms, avg_ms);
+    }
+
     aji_destroy(&c);
     unlink(conf_path);
 
