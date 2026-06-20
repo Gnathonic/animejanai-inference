@@ -219,6 +219,14 @@ if(AJI_MIGRAPHX_LIB AND AJI_HIP_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraph
     add_executable(rife_harness test/rife_harness.cpp)
     target_include_directories(rife_harness PRIVATE include src)
     target_link_libraries(rife_harness PRIVATE aji_rocm)
+
+    # Clean engine-level RIFE+upscale pipeline benchmark: one chain that BOTH
+    # upscales (2x SD Compact) AND interpolates (rife_v4.26, before_upscale), driven
+    # exactly like the player's filter (aji_infer_rife + aji_infer/aji_wait), to
+    # characterize "RIFE 2x at 480p" output fps without mpv noise.
+    add_executable(rife_pipeline_bench test/rife_pipeline_bench.cpp)
+    target_include_directories(rife_pipeline_bench PRIVATE include src)
+    target_link_libraries(rife_pipeline_bench PRIVATE aji_rocm)
 else()
     message(STATUS "MIGraphX (${AJI_ROCM_ROOT} libmigraphx_c) not found; skipping aji_rocm.")
 endif()
