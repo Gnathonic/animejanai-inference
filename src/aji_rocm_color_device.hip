@@ -77,3 +77,41 @@ extern "C" __global__ void k_out_chroma_v(const float* __restrict__ hu, const fl
     if (csp.is_p010) { ((unsigned short*)uvplane)[o] = (unsigned short)uval; ((unsigned short*)uvplane)[o + 1] = (unsigned short)vval; }
     else             { ((unsigned char*)uvplane)[o]  = (unsigned char)uval;  ((unsigned char*)uvplane)[o + 1]  = (unsigned char)vval;  }
 }
+
+// ---- 4:4:4 16-bit planar (Phase B): pure BT.709 matrix, NO chroma resample ----
+// RGB fp16 (NCHW {3,H,W}) <-> three full-res u16 planes (Y, Cb, Cr). post writes u16 to
+// all three planes with qdiv=1/qmax=65535; pre reads three u16 planes. Mirrors the TRT
+// reference k_post444/k_pre444 (kernels.cu). Strides in bytes: ys (Y), cs (Cb and Cr).
+extern "C" __global__ void k_post444(const _Float16* __restrict__ src, int w, int h,
+                                     aji_color_csp csp, unsigned char* yp, long ys,
+                                     unsigned char* cbp, unsigned char* crp, long cs) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    long plane = (long)w * h, idx = (long)y * w + x;
+    float r = (float)src[idx], g = (float)src[plane + idx], b = (float)src[2 * plane + idx];
+    float kg = 1.0f - csp.kr - csp.kb;
+    float Y = csp.kr * r + kg * g + csp.kb * b;
+    float U = (b - Y) / (2.0f * (1.0f - csp.kb));
+    float V = (r - Y) / (2.0f * (1.0f - csp.kr));
+    ((unsigned short*)(yp  + (long)y * ys))[x] = (unsigned short)aji_quant(Y * csp.yscale + csp.yoff, 1.0f, 65535.0f);
+    ((unsigned short*)(cbp + (long)y * cs))[x] = (unsigned short)aji_quant(U * csp.cscale + csp.coff, 1.0f, 65535.0f);
+    ((unsigned short*)(crp + (long)y * cs))[x] = (unsigned short)aji_quant(V * csp.cscale + csp.coff, 1.0f, 65535.0f);
+}
+
+extern "C" __global__ void k_pre444(const unsigned char* yp, long ys,
+                                    const unsigned char* cbp, const unsigned char* crp, long cs,
+                                    int w, int h, aji_color_csp csp, _Float16* dst) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    long plane = (long)w * h, idx = (long)y * w + x;
+    float Y = (((const unsigned short*)(yp  + (long)y * ys))[x] - csp.yoff) / csp.yscale;
+    float U = (((const unsigned short*)(cbp + (long)y * cs))[x] - csp.coff) / csp.cscale;
+    float V = (((const unsigned short*)(crp + (long)y * cs))[x] - csp.coff) / csp.cscale;
+    float kg = 1.0f - csp.kr - csp.kb;
+    dst[idx]             = (_Float16)(Y + 2.0f * (1.0f - csp.kr) * V);
+    dst[2 * plane + idx] = (_Float16)(Y + 2.0f * (1.0f - csp.kb) * U);
+    dst[plane + idx]     = (_Float16)(Y - (2.0f * csp.kb * (1.0f - csp.kb) * U +
+                                           2.0f * csp.kr * (1.0f - csp.kr) * V) / kg);
+}

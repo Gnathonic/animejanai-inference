@@ -94,6 +94,42 @@ static int run_one(int fmt, const char* golden, bool emit) {
     return rc_ret;
 }
 
+// 4:4:4 (Phase B): pre444/post444 are pure-matrix inverses (no chroma resample), so a
+// RGB fp16 -> YUV444 u16 -> RGB fp16 round-trip should recover the input within fp16
+// precision (the only loss is the u16 chroma quant in the middle, ~2e-5 in RGB).
+static int run_444_roundtrip() {
+    const int W = OW, H = OH;
+    aji_csp rc = aji_resample::make_csp(AJI_FMT_YUV444P16, AJI_MATRIX_BT709, AJI_RANGE_LIMITED);
+    aji_color_csp csp{};
+    csp.kr = rc.kr; csp.kb = rc.kb;
+    csp.yscale = rc.yscale; csp.yoff = rc.yoff; csp.cscale = rc.cscale; csp.coff = rc.coff;
+    csp.qdiv = 1.0f; csp.qmax = 65535.0f; csp.is_p010 = 0;
+
+    auto rgbh = make_rgb_fp16();                 // fp16 RGB NCHW {3,H,W}, [0,1]
+    const size_t plane = (size_t)W * H;
+    void *drgb=nullptr,*dY=nullptr,*dCb=nullptr,*dCr=nullptr,*drgb2=nullptr;
+    hipMalloc(&drgb, 3*plane*2); hipMemcpy(drgb, rgbh.data(), 3*plane*2, hipMemcpyHostToDevice);
+    hipMalloc(&dY, plane*2); hipMalloc(&dCb, plane*2); hipMalloc(&dCr, plane*2);
+    hipMalloc(&drgb2, 3*plane*2);
+    const ptrdiff_t st = (ptrdiff_t)W * 2;       // tight u16 planes
+    aji_gpu_post444(drgb, W, H, csp, dY, dCb, dCr, st, st, nullptr);   // RGB -> YUV444 u16
+    aji_gpu_pre444(dY, dCb, dCr, st, st, W, H, csp, drgb2, nullptr);   // YUV444 -> RGB
+    if (hipDeviceSynchronize() != hipSuccess) { fprintf(stderr, "444 sync failed\n"); return 1; }
+
+    std::vector<unsigned short> rgbo(3*plane);
+    hipMemcpy(rgbo.data(), drgb2, 3*plane*2, hipMemcpyDeviceToHost);
+    const double tol = 0.02;
+    double maxd = 0; long bad = 0;
+    for (size_t i = 0; i < rgbo.size(); i++) {
+        _Float16 a, b; std::memcpy(&a, &rgbh[i], 2); std::memcpy(&b, &rgbo[i], 2);
+        double d = std::fabs((double)(float)a - (double)(float)b);
+        if (d > maxd) maxd = d; if (d > tol) bad++;
+    }
+    fprintf(stderr, "[check] 444 roundtrip RGB maxdiff=%.5f baddiff=%ld (tol %.3f)\n", maxd, bad, tol);
+    for (void* p : {drgb,dY,dCb,dCr,drgb2}) hipFree(p);
+    return bad ? 5 : 0;
+}
+
 int main(int argc, char** argv) {
     bool emit = argc > 1 && std::strcmp(argv[1], "--emit") == 0;
     if (aji_color_selftest() != 0) { fprintf(stderr, "selftest FAILED\n"); return 10; }
@@ -101,6 +137,7 @@ int main(int argc, char** argv) {
     int r = 0;
     r |= run_one(AJI_FMT_NV12, "test/fixtures/rocm_color_nv12_128.bin", emit);
     r |= run_one(AJI_FMT_P010, "test/fixtures/rocm_color_p010_128.bin", emit);
+    r |= run_444_roundtrip();
     fprintf(stderr, r ? "RESULT: FAIL\n" : "RESULT: PASS\n");
     return r;
 }

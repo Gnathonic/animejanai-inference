@@ -23,6 +23,7 @@ struct ColorModule {
     bool ok = false;
     hipModule_t mod = nullptr;
     hipFunction_t selftest = nullptr, y_uvdiff = nullptr, chroma_h = nullptr, chroma_v = nullptr;
+    hipFunction_t pre444 = nullptr, post444 = nullptr;   // Phase B 4:4:4
     std::string err;
 };
 
@@ -30,7 +31,7 @@ struct ColorModule {
 std::string src_hash() {
     unsigned long long h = 1469598103934665603ULL;
     const char* p = AJI_ROCM_COLOR_SRC;
-    const char* tag = "v1";                 // bump on launch-convention changes
+    const char* tag = "v2";                 // bump on launch-convention changes (v2: +pre444/post444)
     for (const char* t = tag; *t; t++) { h ^= (unsigned char)*t; h *= 1099511628211ULL; }
     for (; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
     char buf[17]; snprintf(buf, sizeof buf, "%016llx", h);
@@ -90,7 +91,9 @@ ColorModule compile_module() {
         return fn(&m.selftest, "k_selftest") &&
                fn(&m.y_uvdiff, "k_out_y_uvdiff") &&
                fn(&m.chroma_h, "k_out_chroma_h") &&
-               fn(&m.chroma_v, "k_out_chroma_v");
+               fn(&m.chroma_v, "k_out_chroma_v") &&
+               fn(&m.pre444, "k_pre444") &&
+               fn(&m.post444, "k_post444");
     };
 
     // 1) Try the cached code object. On ANY load failure, delete it and recompile.
@@ -184,4 +187,28 @@ extern "C" void aji_gpu_out_color(const void* rgb_fp16, int W, int H, aji_color_
     // Pass 3
     void* a3[] = { &hu, &hv, (void*)&cw, &H, (void*)&ch, (void*)&pv_start, (void*)&pv_wt, &pv_taps, &csp, &uvplane };
     launch(m.chroma_v, dim3((cw + 15) / 16, (ch + 15) / 16), dim3(16, 16), s, a3);
+}
+
+// ---- 4:4:4 (Phase B): pure-matrix, no chroma resample (one block grid each) ----
+// post444: model output RGB fp16 (device, NCHW {3,H,W}) -> three full-res u16 planes.
+// pre444:  three full-res u16 planes -> RGB fp16 (RIFE input). ys = Y byte stride,
+// cs = Cb/Cr byte stride. All pointers device.
+extern "C" void aji_gpu_post444(const void* rgb_fp16, int w, int h, aji_color_csp csp,
+                                void* yplane, void* cbplane, void* crplane,
+                                ptrdiff_t ys, ptrdiff_t cs, void* stream) {
+    ColorModule& m = module();
+    if (!m.ok) { fprintf(stderr, "[aji_color] JIT failed: %s\n", m.err.c_str()); return; }
+    long ysl = (long)ys, csl = (long)cs;
+    void* args[] = { (void*)&rgb_fp16, &w, &h, &csp, &yplane, &ysl, &cbplane, &crplane, &csl };
+    launch(m.post444, dim3((w + 31) / 32, (h + 7) / 8), dim3(32, 8), (hipStream_t)stream, args);
+}
+
+extern "C" void aji_gpu_pre444(const void* yplane, const void* cbplane, const void* crplane,
+                               ptrdiff_t ys, ptrdiff_t cs, int w, int h, aji_color_csp csp,
+                               void* rgb_fp16, void* stream) {
+    ColorModule& m = module();
+    if (!m.ok) { fprintf(stderr, "[aji_color] JIT failed: %s\n", m.err.c_str()); return; }
+    long ysl = (long)ys, csl = (long)cs;
+    void* args[] = { (void*)&yplane, &ysl, (void*)&cbplane, (void*)&crplane, &csl, &w, &h, &csp, &rgb_fp16 };
+    launch(m.pre444, dim3((w + 31) / 32, (h + 7) / 8), dim3(32, 8), (hipStream_t)stream, args);
 }

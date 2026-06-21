@@ -36,6 +36,18 @@ void aji_gpu_out_color(const void* rgb_fp16, int W, int H, aji_color_csp csp,
                        float* Un, float* Vn, float* hu, float* hv,
                        void* yplane, void* uvplane, void* stream);
 
+// 4:4:4 16-bit planar (Phase B): pure BT.709 matrix, NO chroma resample.
+// post444: model output RGB fp16 (device, NCHW {3,H,W}) -> three full-res u16 planes
+//          (Y/Cb/Cr); qdiv=1, qmax=65535 (is_p010 ignored).
+// pre444:  three full-res u16 planes -> RGB fp16 (RIFE 4:4:4 input).
+// ys = Y byte stride, cs = Cb/Cr byte stride. All pointers DEVICE. Runs on `stream`.
+void aji_gpu_post444(const void* rgb_fp16, int w, int h, aji_color_csp csp,
+                     void* yplane, void* cbplane, void* crplane,
+                     ptrdiff_t ys, ptrdiff_t cs, void* stream);
+void aji_gpu_pre444(const void* yplane, const void* cbplane, const void* crplane,
+                    ptrdiff_t ys, ptrdiff_t cs, int w, int h, aji_color_csp csp,
+                    void* rgb_fp16, void* stream);
+
 #ifdef __cplusplus
 }
 #endif
