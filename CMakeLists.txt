@@ -158,10 +158,52 @@ target_include_directories(rife_selftest PRIVATE src include)
 # rife_cpu.cpp pulls resample.h which uses f16c/AVX intrinsics; match aji_rocm's CXX flags.
 target_compile_options(rife_selftest PRIVATE -mf16c -mavx2 -mfma)
 
-# The ncnn-Vulkan backend (aji_vk) is retired: ~7-9x slower than MIGraphX on these
-# models, so it didn't stand up as the AMD path. aji_rocm (below) replaces it; NVIDIA
-# on Linux is served by aji_trt (TensorRT).
 find_package(OpenMP)
+
+# aji_vk: ncnn-Vulkan backend — the PORTABLE Linux/AMD path (no ROCm install required).
+# Revived: gemm-CM (cooperative-matrix) convolutions + GPU-resident bit-exact color reach
+# ~50-72% of MIGraphX at 1080p, and RIFE on ncnn-Vulkan runs ~2.4x faster than ROCm on the
+# warp-heavy RIFE+upscale pipeline. Loaded by the dispatcher as libaji_vk.so for [global]
+# backend=Vulkan (or NCNN). Needs ncnn built with Vulkan at AJI_NCNN_ROOT (and the
+# gridsample_vulkan layer for GPU RIFE warps) + the Vulkan loader. Ships its cs_*.spv color
+# kernels in an spv/ dir next to the .so (found at runtime via dladdr; override AJI_VK_SPV_DIR).
+set(AJI_NCNN_ROOT "" CACHE PATH "ncnn source+build tree (has src/*.h and build*/src/libncnn.so)")
+find_library(AJI_NCNN_LIB NAMES ncnn
+    PATHS "${AJI_NCNN_ROOT}/build/src" "${AJI_NCNN_ROOT}/build-fast/src" "${AJI_NCNN_ROOT}/lib")
+find_path(AJI_NCNN_INC NAMES net.h PATHS "${AJI_NCNN_ROOT}/src")
+find_path(AJI_NCNN_INC_GEN NAMES ncnn_export.h
+    PATHS "${AJI_NCNN_ROOT}/build/src" "${AJI_NCNN_ROOT}/build-fast/src")
+# Just the Vulkan loader; the vulkan/*.h headers come transitively via ncnn's gpu.h on
+# the default include path (find_package(Vulkan) needs an SDK layout we don't require).
+find_library(AJI_VULKAN_LIB NAMES vulkan)
+if(AJI_NCNN_LIB AND AJI_NCNN_INC AND AJI_NCNN_INC_GEN AND AJI_VULKAN_LIB)
+    add_library(aji_vk SHARED src/aji_vk.cpp src/aji_conf.cpp src/rife_cpu.cpp)
+    target_include_directories(aji_vk
+        PUBLIC include
+        PRIVATE src "${AJI_NCNN_INC}" "${AJI_NCNN_INC_GEN}")
+    # -mf16c/-mavx2 so rife_cpu's per-frame fp32<->fp16 RGB casts vectorize (vcvtps2ph/ph2ps).
+    target_compile_options(aji_vk PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mf16c -mavx2 -mfma>)
+    target_link_libraries(aji_vk PRIVATE "${AJI_NCNN_LIB}" "${AJI_VULKAN_LIB}" ${CMAKE_DL_LIBS})
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(aji_vk PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    set_target_properties(aji_vk PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden
+        BUILD_RPATH "$ORIGIN"
+        INSTALL_RPATH "$ORIGIN")
+    if(NOT WIN32)
+        target_link_options(aji_vk PRIVATE -Wl,-Bsymbolic)
+    endif()
+    # ship the color kernels next to the built lib (runtime dladdr looks for ./spv)
+    add_custom_command(TARGET aji_vk POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_CURRENT_SOURCE_DIR}/spv" "$<TARGET_FILE_DIR:aji_vk>/spv")
+    message(STATUS "aji_vk (ncnn-Vulkan) backend: ENABLED (ncnn=${AJI_NCNN_LIB})")
+else()
+    message(STATUS "aji_vk (ncnn-Vulkan): ncnn/Vulkan not found "
+                   "(set -DAJI_NCNN_ROOT to your ncnn tree); skipping")
+endif()
 
 # aji_rocm: AMD ROCm/MIGraphX backend (the Linux/AMD real-time path; ~7-9x faster than
 # the retired ncnn-Vulkan aji_vk, TensorRT-class). Loaded by the dispatcher as

@@ -195,14 +195,13 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     const char *stem = "aji_trt";
     if (lower == "directml") {
         stem = "aji_dml";
-    } else if (lower == "rocm" || lower == "vulkan") {
-        /* vulkan (ncnn) is retired — ~7-9x slower than MIGraphX; route to the AMD
-         * ROCm/MIGraphX backend, the Linux/AMD path */
+    } else if (lower == "rocm") {
+        /* AMD ROCm/MIGraphX backend — the fastest Linux/AMD upscale path */
         stem = "aji_rocm";
-    } else if (lower == "ncnn") {
-        logf_to(params->log, params->log_opaque, 2,
-                "backend=NCNN is retired; using DirectML instead");
-        stem = "aji_dml";
+    } else if (lower == "vulkan" || lower == "ncnn") {
+        /* ncnn-Vulkan backend — the portable Linux/AMD path (no ROCm install
+         * required), and ~2.4x faster than ROCm on the warp-heavy RIFE pipeline */
+        stem = "aji_vk";
     }
 
     aji_backend be = {};
