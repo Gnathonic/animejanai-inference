@@ -1244,7 +1244,17 @@ AJI_EXPORT int aji_wait(aji_ctx* c, uint64_t ticket) {
         c->done_cv.wait(lk, [&] { return c->ring[idx].state == aji_ctx::SLOT_DONE; });
         // the worker already did model + color into the out frame; just release the slot
         c->ring[idx].state = aji_ctx::SLOT_FREE; c->ring[idx].ticket = 0;
-        c->free_cv.notify_one();
+        // Also free any still-occupied slot with an EARLIER ticket. The filter drains the
+        // pipeline on seek/flush (drain_ring) by waiting only the NEWEST ticket - tickets
+        // complete in submission order, so that covers all GPU work, but our slots are freed
+        // per aji_wait. Without this the un-waited older slots leak, and after a few seeks all
+        // kRing slots are gone so aji_infer blocks forever for a free slot (the seek deadlock,
+        // same fix as aji_rocm). The FIFO worker finished every lower-ticket frame already.
+        for (int i = 0; i < aji_ctx::kRing; i++)
+            if (c->ring[i].ticket != 0 && c->ring[i].ticket < ticket) {
+                c->ring[i].state = aji_ctx::SLOT_FREE; c->ring[i].ticket = 0;
+            }
+        c->free_cv.notify_all();
     }
     return AJI_OK;
 }
