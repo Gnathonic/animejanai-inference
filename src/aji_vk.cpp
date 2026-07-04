@@ -1261,6 +1261,9 @@ AJI_EXPORT int aji_wait(aji_ctx* c, uint64_t ticket) {
 
 AJI_EXPORT const char* aji_current_log(aji_ctx* c) { return c ? c->log.c_str() : ""; }
 AJI_EXPORT int aji_scale_factor(aji_ctx* c) { return c ? c->chain_scale : 0; }
+// Engine ring size: the filter clamps its pipeline depth to this (ncnn-Vulkan is
+// multi-worker, so a deep ring keeps every worker fed).
+AJI_EXPORT int aji_max_in_flight(aji_ctx* /*c*/) { return aji_ctx::kRing; }
 // RIFE factor of the active chain: 1 + num/den iff a RIFE engine is actually loaded (so the
 // filter only calls aji_infer_rife once interpolation is live), else 0.
 AJI_EXPORT int aji_rife_factor(aji_ctx* c, int* num, int* den) {

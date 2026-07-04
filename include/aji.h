@@ -171,6 +171,15 @@ AJI_EXPORT int aji_done(aji_ctx *c, uint64_t ticket);
  * loss/timeout. */
 AJI_EXPORT int aji_wait(aji_ctx *c, uint64_t ticket);
 
+/* Max frames the caller may keep in flight (submitted via aji_infer but not yet
+ * aji_wait'd) before aji_infer back-pressures/blocks — i.e. the backend's engine
+ * ring size. The pipelined filter MUST clamp its queue depth to this: submitting
+ * more than the ring holds before collecting deadlocks (the submit fills the ring
+ * and aji_infer blocks for a free slot before the caller ever waits one). Values:
+ * ncnn-Vulkan 12, TensorRT 8, ROCm/MIGraphX 4. A value <= 0 (or a missing symbol
+ * on an older backend) means "unknown — use a conservative default". */
+AJI_EXPORT int aji_max_in_flight(aji_ctx *c);
+
 /* Human-readable description of the active configuration, formatted like
  * currentanimejanai.log (info lines, blank line, numbered steps). Valid
  * after aji_configure() until the next configure/destroy. */

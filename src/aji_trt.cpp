@@ -1591,6 +1591,13 @@ extern "C" AJI_EXPORT int aji_scale_factor(aji_ctx *c)
     return c ? c->scale : 0;
 }
 
+// Completion-event ring size: the filter clamps its pipeline depth to this so it
+// never has more tickets outstanding than the ring tracks.
+extern "C" AJI_EXPORT int aji_max_in_flight(aji_ctx * /*c*/)
+{
+    return aji_ctx::TICK_RING;
+}
+
 extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)
 {
     if (!c || !c->build_done_flag.exchange(0))

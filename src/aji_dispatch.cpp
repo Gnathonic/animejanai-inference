@@ -41,6 +41,7 @@ struct aji_backend {
     int (*wait)(aji_ctx *, uint64_t);
     const char *(*current_log)(aji_ctx *);
     int (*scale_factor)(aji_ctx *);
+    int (*max_in_flight)(aji_ctx *);   // optional (older backends lack it -> NULL)
     int (*rife_factor)(aji_ctx *, int *, int *);
     int (*rife_before_upscale)(aji_ctx *);
     int (*poll)(aji_ctx *);
@@ -161,6 +162,9 @@ static bool load_backend(const char *stem, aji_backend *be,
     SYM(current_log,  "aji_current_log");
     SYM(scale_factor, "aji_scale_factor");
     SYM(rife_factor,  "aji_rife_factor");
+    // aji_max_in_flight is OPTIONAL: a backend built before it existed still loads
+    // (the field stays NULL and the exported wrapper returns a conservative default).
+    *(void **)&be->max_in_flight = lib_sym(be->lib, "aji_max_in_flight");
     SYM(rife_before_upscale, "aji_rife_before_upscale");
     SYM(poll,         "aji_poll");
     SYM(infer_rife,   "aji_infer_rife");
@@ -263,6 +267,14 @@ extern "C" AJI_EXPORT const char *aji_current_log(aji_ctx *c)
 extern "C" AJI_EXPORT int aji_scale_factor(aji_ctx *c)
 {
     return c->be.scale_factor(c->inner);
+}
+
+extern "C" AJI_EXPORT int aji_max_in_flight(aji_ctx *c)
+{
+    // Optional in the backend: a lib built before this symbol existed leaves the
+    // pointer NULL; return 0 ("unknown") so the caller uses its own conservative
+    // default rather than crashing.
+    return (c && c->be.max_in_flight) ? c->be.max_in_flight(c->inner) : 0;
 }
 
 extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)

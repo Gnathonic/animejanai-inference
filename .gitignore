@@ -8,7 +8,9 @@ sanity/saxpy
 
 # Linux Vulkan backend build artifacts
 /build/
+/build-vk/
 libaji_rocm.so
+aji_rocm_compile
 
 # hipRTC JIT cache (per-machine, per-GPU; created at runtime; never commit)
 *.co

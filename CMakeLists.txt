@@ -248,6 +248,19 @@ if(AJI_MIGRAPHX_LIB AND AJI_HIP_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraph
         target_link_options(aji_rocm PRIVATE -Wl,-Bsymbolic)
     endif()
 
+    # aji_rocm_compile: the OUT-OF-PROCESS MIGraphX engine compiler. The async_build
+    # path fork/execs this instead of compiling MIGraphX in-process, so a player quit
+    # mid-compile just SIGKILLs the child (no in-process compile threads racing exit
+    # teardown). Ships next to libaji_rocm.so (aji_rocm finds it via dladdr). Shares
+    # aji_rocm_mxr.h with the lib so the compiled .mxr is byte-identical.
+    add_executable(aji_rocm_compile src/aji_rocm_compile.cpp)
+    target_include_directories(aji_rocm_compile PRIVATE include src "${AJI_ROCM_ROOT}/include")
+    target_link_libraries(aji_rocm_compile PRIVATE ${AJI_MIGRAPHX_LIB} ${AJI_HIP_LIB})
+    set_target_properties(aji_rocm_compile PROPERTIES
+        BUILD_RPATH "${AJI_ROCM_ROOT}/lib"
+        INSTALL_RPATH "$ORIGIN:${AJI_ROCM_ROOT}/lib")
+    add_dependencies(aji_rocm aji_rocm_compile)   # build the helper alongside the lib
+
     # Characterization test for the GPU out-color kernels (golden regression).
     add_executable(aji_rocm_color_test test/rocm_color_test.cpp src/aji_rocm_color.cpp ${AJI_COLOR_GEN})
     target_include_directories(aji_rocm_color_test PRIVATE include src ${CMAKE_CURRENT_BINARY_DIR}/gen "${AJI_ROCM_ROOT}/include")

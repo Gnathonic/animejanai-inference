@@ -34,6 +34,7 @@
 
 #include <migraphx/migraphx.hpp>
 #include <hip/hip_runtime_api.h>
+#include "aji_rocm_mxr.h"   // shared mxr_cache_path / mxr_cached / aji_rocm_compile_mxr
 
 #include <cstdint>
 #include <cstdio>
@@ -45,6 +46,11 @@
 #include <vector>
 #include <algorithm>
 #include <atomic>   // async engine compile (async_build)
+#include <dlfcn.h>      // dladdr: locate the aji_rocm_compile helper next to this .so
+#include <unistd.h>     // fork/execl/_exit
+#include <sys/wait.h>   // waitpid
+#include <csignal>      // kill (stop an in-flight out-of-process compile at quit)
+#include <cerrno>       // errno (EINTR retry on waitpid)
 #include <thread>
 #include <mutex>    // async inference pipeline (P4 overlap)
 #include <condition_variable>
@@ -112,18 +118,23 @@ struct PinnedHalf {
 
 // One background MIGraphX compile. MIGraphX builds a static per-resolution
 // engine in ~140s; blocking aji_configure on that would freeze the player, so
-// an uncached model compiles on a worker thread while the chain runs
-// passthrough, and aji_poll() reports completion (the filter then reconfigures
-// and the now-cached .mxr loads in ~1s). The worker captures a shared_ptr to
-// this — NOT the aji_ctx — so it never touches ctx state and aji_destroy can
-// detach it without a use-after-free or a shutdown hang. Mirrors aji_trt's
-// async build, so the existing engine_monitor.lua OSD drives both backends.
+// an uncached model compiles OUT OF PROCESS (the aji_rocm_compile helper) while
+// the chain runs passthrough, and aji_poll() reports completion (the filter then
+// reconfigures and the now-cached .mxr loads in ~1s). The worker thread only
+// fork/execs the helper and waitpid()s on it, capturing a shared_ptr to this —
+// NOT the aji_ctx — so it never touches ctx state. The compile itself runs in the
+// child, so aji_destroy at player-quit just SIGKILLs the child (child pid) and
+// joins the now-unblocked waiter: instant quit, and NO in-process MIGraphX compile
+// threads racing process-exit teardown (which caused SIGSEGV / "pure virtual" /
+// hang when this used an in-process std::thread + detach). Mirrors aji_trt's
+// out-of-process trtexec build, so the existing engine_monitor.lua OSD drives both.
 struct BuildState {
     std::string onnx, key;     // .onnx path and its .mxr cache path (the failed-set key)
-    int w = 0, h = 0;          // input shape the engine is compiled for
+    int w = 0, h = 0, ch = 3;  // input shape (+ channels) the engine is compiled for
     std::atomic<int> done{0};  // 0 running, 1 finished (success or failure)
     std::atomic<bool> ok{false};
     std::atomic<bool> reported{false};  // aji_poll has returned 1 for this build
+    std::atomic<pid_t> child{0};  // the aji_rocm_compile subprocess pid (0 = none); killed at quit
     std::string err;           // set by the worker; read by main only after done==1
 };
 
@@ -216,7 +227,9 @@ struct aji_ctx {
         bool gpu_colored = false;   // worker already wrote out (GPU out-color); wait skips gpu_post
         std::string errmsg;
     };
-    static const int kRing = 4;     // in-flight depth cap (filter depth is small; submit back-pressures if full)
+    static const int kRing = 4;     // in-flight cap; exported via aji_max_in_flight so the
+                                    // filter clamps its queue depth to it (submitting more than
+                                    // this before collecting would deadlock the submit loop)
     InferSlot slots[kRing];
     std::thread infer_worker;
     std::mutex infer_mtx;
@@ -271,69 +284,67 @@ static int round_even(double x) {
 // onto the GPU (P4), not more CPU threads.
 static inline int color_nt(const aji_ctx* c, long /*npix*/) { return c->nthreads; }
 
-// The cache file for one engine: <onnx>.<W>x<H>.c<channels>.dev.mlir.fp16.mxr next to the
-// model. The channel count is folded into the key so an 11-ch RIFE engine at the same
-// resolution can't collide with a 3-ch upscaler engine. The ".mlir" tag invalidates the
-// older MLIR-disabled engines, which had a non-deterministic MIOpen-fallback conv artifact
-// (evenly-spaced column static) at 4K.
-static std::string mxr_cache_path(const std::string& onnx, int w, int h, int channels = 3) {
-    return onnx + "." + std::to_string(w) + "x" + std::to_string(h)
-           + ".c" + std::to_string(channels) + ".dev.mlir.fp16.mxr";
-}
-static bool mxr_cached(const std::string& onnx, int w, int h, int channels = 3) {
-    std::ifstream probe(mxr_cache_path(onnx, w, h, channels), std::ios::binary);
-    return probe.good();
-}
+// mxr_cache_path / mxr_cached / aji_rocm_compile_mxr now live in aji_rocm_mxr.h,
+// shared with the out-of-process helper (aji_rocm_compile) so the async and sync
+// compile paths produce byte-identical engines. Cache key:
+// <onnx>.<W>x<H>.c<channels>.dev.mlir.fp16.mxr next to the model (channels folded in
+// so an 11-ch RIFE engine can't collide with a 3-ch upscaler; ".mlir" invalidates the
+// older MLIR-disabled engines with the MIOpen-fallback 4K column-static artifact).
 
-// Parse + fp16-quantize + GPU-compile one .onnx at a FIXED input shape and save the
-// engine. Touches NO ctx state, so it is safe to run on a worker thread. Writes to a
-// temp file then atomically renames into place, so an interrupted compile (player quit
-// mid-build) never leaves a half-written .mxr that would later fail to load.
-// Returns false + *errout on error.
-static bool compile_mxr(const std::string& onnx_path, int in_w, int in_h, std::string* errout,
-                        int in_channels = 3) {
-    try {
-        // MLIR (rocMLIR) is the DEFAULT conv codegen on RDNA and is REQUIRED for correctness:
-        // disabling it falls back to a MIOpen conv solver that reads uninitialized workspace at
-        // 4K and yields non-deterministic, evenly-spaced column static (confirmed: MLIR-off
-        // differs every run, MLIR-on is bit-identical). It costs ~70s more compile (one-time,
-        // behind the progress bar) and ZERO inference fps (measured 32.4 vs 32.5ms). So leave
-        // MLIR on (the 2.15 default); MIGRAPHX_DISABLE_MLIR=1 in the env still forces it off for
-        // experiments. (Dynamic-shape compile is still impossible: the SPAN reflect-pad preamble
-        // has non-constant pads MIGraphX can't parse dynamically.)
-        migraphx::onnx_options oo;
-        oo.set_input_parameter_shape("input", {1, (size_t)in_channels, (size_t)in_h, (size_t)in_w});
-        auto prog = migraphx::parse_onnx(onnx_path.c_str(), oo);
-        migraphx::quantize_fp16(prog);
-        migraphx::compile_options co; co.set_offload_copy(false);  // device-resident
-        prog.compile(migraphx::target("gpu"), co);
-        const std::string cache = mxr_cache_path(onnx_path, in_w, in_h, in_channels);
-        const std::string tmp = cache + ".tmp." + std::to_string(in_w) + "x" + std::to_string(in_h);
-        migraphx::save(prog, tmp.c_str());
-        if (std::rename(tmp.c_str(), cache.c_str()) != 0) {
-            std::remove(tmp.c_str());
-            throw std::runtime_error("could not rename engine into place");
-        }
-        return true;
-    } catch (const std::exception& e) {
-        if (errout) *errout = std::string("migraphx compile failed (") + onnx_path + "): " + e.what();
-        return false;
+// Absolute path to the aji_rocm_compile helper, which ships next to libaji_rocm.so
+// (dladdr on a symbol in this library -> its dir -> /aji_rocm_compile). Falls back to
+// the bare name (PATH lookup) if the .so path can't be resolved.
+static std::string rocm_compile_helper_path() {
+    Dl_info info{};
+    if (dladdr((void*)&rocm_compile_helper_path, &info) && info.dli_fname) {
+        std::string p = info.dli_fname;
+        auto slash = p.find_last_of('/');
+        if (slash != std::string::npos) return p.substr(0, slash) + "/aji_rocm_compile";
     }
+    return "aji_rocm_compile";
 }
 
-// Kick a background compile of one engine; the configure that called this returns
-// passthrough and aji_poll() reports when to reconfigure. The worker captures only a
-// shared_ptr to the BuildState (never the ctx), so it outlives the ctx safely.
+// Fork/exec the out-of-process compiler and wait for it. Publishes the child pid to
+// bs->child so aji_destroy can SIGKILL an in-flight compile at quit. fork-then-immediate-
+// exec is async-signal-safe, so it is safe from this worker thread of the multithreaded
+// player. Returns true iff the child exited 0 AND the .mxr is now on disk.
+static bool run_compile_subprocess(const std::string& helper,
+                                   const std::shared_ptr<BuildState>& bs, int in_channels) {
+    const std::string w = std::to_string(bs->w), h = std::to_string(bs->h),
+                      ch = std::to_string(in_channels);
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        execl(helper.c_str(), helper.c_str(), bs->onnx.c_str(), w.c_str(), h.c_str(),
+              ch.c_str(), (char*)nullptr);
+        _exit(127);   // exec failed (helper missing/not executable)
+    }
+    bs->child.store(pid);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) { /* retry */ }
+    bs->child.store(0);
+    const bool exited0 = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return exited0 && mxr_cached(bs->onnx, bs->w, bs->h, in_channels);
+}
+
+// Kick a background compile of one engine OUT OF PROCESS; the configure that called this
+// returns passthrough and aji_poll() reports when to reconfigure. The worker thread only
+// fork/execs the helper and waits — it captures a shared_ptr to the BuildState (never the
+// ctx), so it outlives the ctx safely, and the compile runs in a child process that quit
+// can SIGKILL (no in-process MIGraphX compile threads to race process-exit teardown).
 static void start_async_build(aji_ctx* c, const std::string& onnx, int w, int h,
                               int in_channels = 3) {
     if (c->build_thread.joinable()) c->build_thread.join();  // reap a previous finished worker
     auto bs = std::make_shared<BuildState>();
-    bs->onnx = onnx; bs->key = mxr_cache_path(onnx, w, h, in_channels); bs->w = w; bs->h = h;
+    bs->onnx = onnx; bs->key = mxr_cache_path(onnx, w, h, in_channels);
+    bs->w = w; bs->h = h; bs->ch = in_channels;
     c->build = bs;
-    c->build_thread = std::thread([bs, in_channels]() {
-        std::string e;
-        bool ok = compile_mxr(bs->onnx, bs->w, bs->h, &e, in_channels);
-        bs->err = e;
+    const std::string helper = rocm_compile_helper_path();
+    c->build_thread = std::thread([bs, in_channels, helper]() {
+        bool ok = run_compile_subprocess(helper, bs, in_channels);
+        if (!ok)
+            bs->err = "aji_rocm_compile failed for " + bs->onnx + " (helper: " + helper +
+                      "); see stderr for the migraphx error";
         bs->ok.store(ok);
         bs->done.store(1);   // release: main reads ok/err only after seeing done==1
     });
@@ -354,9 +365,11 @@ static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_
     const std::string cache = mxr_cache_path(onnx_path, in_w, in_h, in_channels);
     try {
         if (!mxr_cached(onnx_path, in_w, in_h, in_channels)) {
-            // sync (CLI/benchmark) path: async_build defers before getting here
+            // sync (CLI/benchmark) path: async_build defers before getting here. In-process
+            // compile is safe here because aji_configure blocks until it finishes (no detach,
+            // no process-exit race); only the ASYNC path needs the out-of-process helper.
             std::string e;
-            if (!compile_mxr(onnx_path, in_w, in_h, &e, in_channels)) { c->err = e; return nullptr; }
+            if (!aji_rocm_compile_mxr(onnx_path, in_w, in_h, &e, in_channels)) { c->err = e; return nullptr; }
         }
         m->prog = migraphx::load(cache.c_str());
     } catch (const std::exception& e) {
@@ -1314,6 +1327,9 @@ AJI_EXPORT int aji_wait(aji_ctx* c, uint64_t ticket) {
 
 AJI_EXPORT const char* aji_current_log(aji_ctx* c) { return c ? c->log.c_str() : ""; }
 AJI_EXPORT int aji_scale_factor(aji_ctx* c) { return c ? c->chain_scale : 0; }
+// Engine ring size: the filter clamps its pipeline depth to this so it never submits
+// more frames than the ring holds before collecting (which would deadlock).
+AJI_EXPORT int aji_max_in_flight(aji_ctx* /*c*/) { return aji_ctx::kRing; }
 // 0 (no interpolation) until the RIFE .mxr is actually loaded — the filter only calls
 // aji_infer_rife when this returns 1, so it must stay 0 while the engine compiles.
 AJI_EXPORT int aji_rife_factor(aji_ctx* c, int* num, int* den) {
@@ -1495,11 +1511,17 @@ AJI_EXPORT void aji_destroy(aji_ctx** c) {
     if (c && *c) {
         infer_worker_stop(*c);   // drain + join the inference worker
         (*c)->gc.free();         // free GPU out-color device buffers
-        // A compile may still be running (player quit mid-build). The worker holds its
-        // own shared_ptr to the BuildState and never touches the ctx, so detaching is
-        // safe — no use-after-free, and aji_destroy doesn't hang for ~140s. The temp-then-
-        // rename save means an abandoned compile leaves no half-written .mxr.
-        if ((*c)->build_thread.joinable()) (*c)->build_thread.detach();
+        // A compile may still be running out of process (player quit mid-build). SIGKILL
+        // the aji_rocm_compile child so quit is instant, then join the now-unblocked waiter
+        // thread. The compile lives in the CHILD, so this leaves NO in-process MIGraphX
+        // compile threads to race the C++ runtime's process-exit teardown (the old detach
+        // of an in-process compile thread crashed: SIGSEGV / "pure virtual" / hang). The
+        // helper's temp-then-rename means a killed compile leaves no half-written .mxr.
+        if ((*c)->build) {
+            pid_t child = (*c)->build->child.load();
+            if (child > 0) kill(child, SIGKILL);
+        }
+        if ((*c)->build_thread.joinable()) (*c)->build_thread.join();
         delete *c; *c = nullptr;
     }
 }
