@@ -1,0 +1,19 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage: require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16: require
+layout(local_size_x = 32, local_size_y = 8) in;
+layout(binding = 0) readonly  buffer Src   { float16_t src[]; };
+layout(binding = 1) readonly  buffer Start { float startf[]; };
+layout(binding = 2) readonly  buffer Wt    { float wt[]; };
+layout(binding = 3) writeonly buffer Dst   { float16_t dst[]; };
+layout(push_constant) uniform parameter { int dstw; int h; int taps; int srcw; } p;
+int mirr(int i, int n){ i = i<0 ? -i-1 : i; i = i>=n ? 2*n-1-i : i; return clamp(i,0,n-1); }
+void main(){
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= p.dstw || y >= p.h) return;
+    int s0 = int(startf[x]);
+    float a = 0.0;
+    for (int j = 0; j < p.taps; j++)
+        a += wt[x*p.taps + j] * float(src[y*p.srcw + mirr(s0+j, p.srcw)]);
+    dst[y*p.dstw + x] = float16_t(a);
+}

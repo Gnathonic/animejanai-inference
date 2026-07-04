@@ -1,0 +1,22 @@
+#version 450
+layout(local_size_x = 32, local_size_y = 8) in;
+layout(binding = 0) readonly  buffer UV    { uint uvraw[]; };   // interleaved Cb,Cr (packed u8/u16)
+layout(binding = 1) readonly  buffer Start { float startf[]; };
+layout(binding = 2) readonly  buffer Wt    { float wt[]; };
+layout(binding = 3) writeonly buffer T0u   { float t0u[]; };
+layout(binding = 4) writeonly buffer T0v   { float t0v[]; };
+layout(push_constant) uniform parameter { int W; int ch; int taps; int cw; int bpp; } p;
+int mirr(int i, int n){ i = i<0 ? -i-1 : i; i = i>=n ? 2*n-1-i : i; return clamp(i,0,n-1); }
+float rdC(int idx, int comp){            // chroma sample at (idx) , comp 0=Cb 1=Cr; interleaved
+    int e = idx*2 + comp;
+    if (p.bpp == 2) { uint w = uvraw[e>>1]; return float((w >> ((e&1)*16)) & 0xFFFFu); }
+    else            { uint w = uvraw[e>>2]; return float((w >> ((e&3)*8))  & 0xFFu);   }
+}
+void main(){
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= p.W || y >= p.ch) return;
+    int s0 = int(startf[x]); float u = 0.0, v = 0.0;
+    for (int j = 0; j < p.taps; j++){ float wj = wt[x*p.taps + j]; int s = mirr(s0+j, p.cw);
+        u += wj * rdC(y*p.cw + s, 0); v += wj * rdC(y*p.cw + s, 1); }
+    t0u[y*p.W + x] = u; t0v[y*p.W + x] = v;
+}

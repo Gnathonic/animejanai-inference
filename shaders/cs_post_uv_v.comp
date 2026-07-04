@@ -1,0 +1,29 @@
+#version 450
+layout(local_size_x = 32, local_size_y = 8) in;
+// vertical chroma downsample of U,V (cw x srch) + quantize + interleave -> (cw*dsth*2) float
+layout(binding = 0) readonly  buffer Uin   { float uin[]; };
+layout(binding = 1) readonly  buffer Vin   { float vin[]; };
+layout(binding = 2) readonly  buffer Start { float startf[]; };
+layout(binding = 3) readonly  buffer Wt    { float wt[]; };
+layout(binding = 4) writeonly buffer Out   { float outp[]; };  // interleaved Cb,Cr quantized (raw units)
+layout(push_constant) uniform parameter {
+    int cw; int dsth; int taps; int srch; float coff; float cscale; float qdiv; float qmax; int pad;
+} p;
+int mirr(int i, int n){ i = i<0 ? -i-1 : i; i = i>=n ? 2*n-1-i : i; return clamp(i,0,n-1); }
+void main(){
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= p.cw || y >= p.dsth) return;
+    int s0 = int(startf[y]);
+    float u = 0.0, v = 0.0;
+    for (int j = 0; j < p.taps; j++){
+        float wj = wt[y*p.taps + j];
+        int sy = mirr(s0+j, p.srch);
+        u += wj * uin[sy*p.cw + x];
+        v += wj * vin[sy*p.cw + x];
+    }
+    float uq = clamp(roundEven((u*p.cscale + p.coff)/p.qdiv), 0.0, p.qmax) * p.qdiv;
+    float vq = clamp(roundEven((v*p.cscale + p.coff)/p.qdiv), 0.0, p.qmax) * p.qdiv;
+    int idx = y*p.cw + x;
+    outp[2*idx]     = uq;
+    outp[2*idx + 1] = vq;
+}

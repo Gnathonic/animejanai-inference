@@ -1,0 +1,23 @@
+#version 450
+layout(local_size_x = 32, local_size_y = 8) in;
+layout(binding = 0) readonly  buffer Y   { uint yraw[]; };   // full-res Y (packed u8/u16)
+layout(binding = 1) readonly  buffer T1u { float t1u[]; };
+layout(binding = 2) readonly  buffer T1v { float t1v[]; };
+layout(binding = 3) writeonly buffer RGB { float rgb[]; };
+layout(push_constant) uniform parameter { int W; int H; float kr; float kb; float yoff; float yscale; float coff; float cscale; int bpp; int cstep; } p;
+float rdY(int i){
+    if (p.bpp == 2) { uint w = yraw[i>>1]; return float((w >> ((i&1)*16)) & 0xFFFFu); }
+    else            { uint w = yraw[i>>2]; return float((w >> ((i&3)*8))  & 0xFFu);   }
+}
+void main(){
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= p.W || y >= p.H) return;
+    int idx = y*p.W + x;
+    float Y = (rdY(idx)   - p.yoff) / p.yscale;
+    float U = (t1u[idx]   - p.coff) / p.cscale;
+    float V = (t1v[idx]   - p.coff) / p.cscale;
+    float kg = 1.0 - p.kr - p.kb;
+    rgb[idx]              = Y + 2.0*(1.0 - p.kr)*V;                                              // R (plane 0)
+    rgb[2*p.cstep + idx]  = Y + 2.0*(1.0 - p.kb)*U;                                              // B (plane 2)
+    rgb[p.cstep + idx]    = Y - (2.0*p.kb*(1.0 - p.kb)*U + 2.0*p.kr*(1.0 - p.kr)*V) / kg;        // G (plane 1)
+}
