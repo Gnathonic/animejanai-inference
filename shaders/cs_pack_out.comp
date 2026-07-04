@@ -1,0 +1,31 @@
+#version 450
+layout(local_size_x = 32, local_size_y = 8) in;
+// Pack a quantized fp32 plane (values already clamped to the container scale by
+// cs_post_matrix3 / cs_post_uv_v) into u8x4 (NV12) or u16x2 (P010) words, so the
+// host download shrinks 4x/2x and the CPU cast loop becomes a row memcpy.
+// uint(v) truncates toward zero exactly like the host (uint8_t)/(uint16_t) casts
+// it replaces, so the packed bytes are bit-identical to the old path.
+layout(binding = 0) readonly  buffer In  { float inp[]; };
+layout(binding = 1) writeonly buffer Out { uint  outw[]; };
+layout(push_constant) uniform parameter {
+    int w; int h; int wordsPerRow; int u16;
+} p;
+void main(){
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= p.wordsPerRow || y >= p.h) return;
+    uint word = 0u;
+    if (p.u16 != 0) {
+        int base = y*p.w + x*2;
+        for (int i = 0; i < 2; i++) {
+            int col = x*2 + i;
+            if (col < p.w) word |= (uint(inp[base + i]) & 0xFFFFu) << (16*i);
+        }
+    } else {
+        int base = y*p.w + x*4;
+        for (int i = 0; i < 4; i++) {
+            int col = x*4 + i;
+            if (col < p.w) word |= (uint(inp[base + i]) & 0xFFu) << (8*i);
+        }
+    }
+    outw[y*p.wordsPerRow + x] = word;
+}

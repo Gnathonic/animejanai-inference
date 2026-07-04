@@ -188,8 +188,10 @@ struct aji_ctx {
     // resample.h path), only ~12-50MB of YUV is downloaded. Frees the CPU entirely. ---
     bool gpu_color = true;        // AJI_VK_CPUCOLOR=1 falls back to the CPU path
     bool gpu_incolor = false;     // AJI_VK_GPUINCOLOR=1: in-color (YUV->RGB) on the GPU too (frees the filter thread)
+    bool packed_dl = true;        // AJI_VK_PACKED_DL=0: fp32 download + host cast loop (old path)
     struct GpShared {             // shared, read-only across workers; (re)built per output res
         ncnn::Pipeline *p_mat = nullptr, *p_h = nullptr, *p_uvv = nullptr;
+        ncnn::Pipeline *p_pack = nullptr;     // cs_pack_out: fp32 -> u8x4/u16x2 words for the download
         ncnn::Layer* cast = nullptr;          // ncnn-native fp16->fp32 cast for the model output
         ncnn::Option castopt;
         ncnn::VkMat vPHs, vPHw, vPVs, vPVw;   // chroma-down spline36 weights (start, taps)
@@ -205,6 +207,9 @@ struct aji_ctx {
     struct GpBuf {               // per-worker GPU-post scratch (3D-c1 VkMats; elempack-1)
         ncnn::VkMat vIn, Un, Vn, Yout, hu, hv, uvout, dV, dH, dUV;
         ncnn::Mat oy, ouv; bool ready = false; bool fp16 = false;  // tracks GpShared.fp16 it was built for
+        // packed-download scratch (word buffers + dispatch mats + host targets);
+        // sized per samples-per-word, rebuilt when the output format flips NV12<->P010
+        ncnn::VkMat pY, pUV, dPY, dPUV; ncnn::Mat opy, opuv; int packspp = 0;
         // GPU in-color per-worker scratch
         ncnn::VkMat ivRawY, ivRawUV, it0u, it0v, it1u, it1v, ivRGB, ivModel, idH, idV, idM;
         bool iready = false;
@@ -790,6 +795,10 @@ static bool build_gp_shared(aji_ctx* c, int W2, int H2, int fmt, int matx, int r
         g.p_mat = mk(want_fp16 ? "cs_post_matrix3_f16" : "cs_post_matrix3");
         g.p_h   = mk(want_fp16 ? "cs_h_f16"            : "cs_h_f32");
         g.p_uvv = mk(want_fp16 ? "cs_post_uv_v_f16"    : "cs_post_uv_v");
+        if (c->packed_dl) {
+            delete g.p_pack; g.p_pack = mk("cs_pack_out");
+            if (!g.p_pack) { logmsg(c, 2, c->err.c_str()); return false; }
+        }
         if (!g.p_mat || !g.p_h || !g.p_uvv) { logmsg(c, 2, c->err.c_str()); return false; }
     }
     g.fp16 = want_fp16;
@@ -930,6 +939,14 @@ static int run_gpu_post(aji_ctx* c, aji_ctx::GpBuf& b, ncnn::VkAllocator* blob, 
         b.dV.create(W2, H2, (size_t)4u, blob); b.dH.create(cw2, H2, (size_t)4u, blob); b.dUV.create(cw2, ch2, (size_t)4u, blob);
         b.ready = true;
     }
+    // packed-download word geometry: u8x4 per word (NV12) / u16x2 per word (P010)
+    const int spp = (out_format == AJI_FMT_P010) ? 2 : 4;
+    const int wY  = (W2 + spp - 1) / spp, wUV = (cw2 * 2 + spp - 1) / spp;
+    if (c->packed_dl && b.packspp != spp) {
+        b.pY.create(wY, H2, (size_t)4u, blob);   b.pUV.create(wUV, ch2, (size_t)4u, blob);
+        b.dPY.create(wY, H2, (size_t)4u, blob);  b.dPUV.create(wUV, ch2, (size_t)4u, blob);
+        b.packspp = spp;
+    }
     const float qdiv = (out_format == AJI_FMT_P010) ? 64.0f : 1.0f;
     const float qmax = (out_format == AJI_FMT_P010) ? 1023.0f : 255.0f;
     // FUSED: model eval + GPU post-color + download in ONE command submission, so the GPU runs
@@ -954,10 +971,21 @@ static int run_gpu_post(aji_ctx* c, aji_ctx::GpBuf& b, ncnn::VkAllocator* blob, 
       { std::vector<ncnn::vk_constant_type> cc(9); cc[0].i=cw2;cc[1].i=ch2;cc[2].i=g.pvtaps;cc[3].i=H2;cc[4].f=g.csp.coff;cc[5].f=g.csp.cscale;cc[6].f=qdiv;cc[7].f=qmax;cc[8].i=0;
         cmd.record_pipeline(g.p_uvv, {b.hu, b.hv, g.vPVs, g.vPVw, b.uvout}, cc, b.dUV); }
       (void)blob;
-      cmd.record_download(b.Yout, b.oy, popt); cmd.record_download(b.uvout, b.ouv, popt);
+      if (c->packed_dl && g.p_pack) {
+          // pack the quantized fp32 planes into u8x4/u16x2 words on the GPU, then
+          // download the words: 4x/2x less PCIe traffic and the host cast loop
+          // becomes a row memcpy. Bit-identical (uint() truncates like the casts).
+          { std::vector<ncnn::vk_constant_type> cc(4); cc[0].i=W2;      cc[1].i=H2;  cc[2].i=wY;  cc[3].i=(spp==2)?1:0;
+            cmd.record_pipeline(g.p_pack, {b.Yout, b.pY}, cc, b.dPY); }
+          { std::vector<ncnn::vk_constant_type> cc(4); cc[0].i=cw2*2;   cc[1].i=ch2; cc[2].i=wUV; cc[3].i=(spp==2)?1:0;
+            cmd.record_pipeline(g.p_pack, {b.uvout, b.pUV}, cc, b.dPUV); }
+          cmd.record_download(b.pY, b.opy, popt); cmd.record_download(b.pUV, b.opuv, popt);
+      } else {
+          cmd.record_download(b.Yout, b.oy, popt); cmd.record_download(b.uvout, b.ouv, popt);
+      }
       if (cmd.submit_and_wait() != 0) { c->err = "gp: fused submit"; return AJI_ERR; } }
     double tt1 = kTiming ? aji_now() : 0;
-    { static bool once=false; if(!once && getenv("AJI_VK_GPDBG")){ once=true;
+    { static bool once=false; if(!once && !c->packed_dl && getenv("AJI_VK_GPDBG")){ once=true;
         const float* yf=(const float*)b.oy.data; double s=0,mn=1e9,mx=-1e9; long t=(long)W2*H2,nz=0;
         for(long i=0;i<t;i++){float v=yf[i]; s+=v; if(v<mn)mn=v; if(v>mx)mx=v; if(v!=0)nz++;}
         fprintf(stderr,"[gp Yout] mean=%.2f min=%.1f max=%.1f nonzero=%.1f%% | oy.dims=%d w=%d h=%d ep=%d\n",s/t,mn,mx,100.0*nz/t,b.oy.dims,b.oy.w,b.oy.h,b.oy.elempack); } }
@@ -967,6 +995,25 @@ static int run_gpu_post(aji_ctx* c, aji_ctx::GpBuf& b, ncnn::VkAllocator* blob, 
     // gpu_post row loops). W workers can pack concurrently, so cap the per-worker
     // width to keep the whole box at ~nthreads total.
     const int NTp = std::max(1, c->nthreads / std::max(1, c->num_workers));
+    if (c->packed_dl) {
+        // packed words already carry the container byte layout: pure row memcpys
+        const uint8_t* py = (const uint8_t*)b.opy.data; const uint8_t* puv = (const uint8_t*)b.opuv.data;
+        const size_t prowY = (size_t)wY * 4, prowUV = (size_t)wUV * 4;
+        const int bppo = (out_format == AJI_FMT_P010) ? 2 : 1;
+        uint8_t* yp = (uint8_t*)out->plane[0]; uint8_t* uvp = (uint8_t*)out->plane[1];
+        ptrdiff_t ys = out->stride[0] ? out->stride[0] : (ptrdiff_t)W2 * bppo;
+        ptrdiff_t uvs = out->stride[1] ? out->stride[1] : (ptrdiff_t)cw2 * 2 * bppo;
+        #pragma omp parallel for schedule(static) num_threads(NTp)
+        for (int y = 0; y < H2; y++)
+            memcpy(yp + (ptrdiff_t)y * ys, py + (size_t)y * prowY, (size_t)W2 * bppo);
+        #pragma omp parallel for schedule(static) num_threads(NTp)
+        for (int y = 0; y < ch2; y++)
+            memcpy(uvp + (ptrdiff_t)y * uvs, puv + (size_t)y * prowUV, (size_t)cw2 * 2 * bppo);
+        if (kTiming) { static double sg2=0,sk2=0; static long sn2=0;
+            sg2+=(tt1-tt0)*1000; sk2+=(aji_now()-tt1)*1000; sn2++;
+            if (sn2%60==0) fprintf(stderr,"[gp] fused gpu(model+post+pack+dl)=%.2fms rowcopy=%.2fms (W=%d)\n", sg2/sn2,sk2/sn2,c->num_workers); }
+        return AJI_OK;
+    }
     const float* yf = (const float*)b.oy.data; const float* uvf = (const float*)b.ouv.data;
     if (out_format == AJI_FMT_P010) {
         uint16_t* yp = (uint16_t*)out->plane[0]; uint16_t* uvp = (uint16_t*)out->plane[1];
@@ -1082,6 +1129,10 @@ AJI_EXPORT aji_ctx* aji_create(const aji_create_params* p) {
     // the GPU saturated so it boosts). AJI_VK_CPUCOLOR=1 forces the CPU fallback.
     c->gpu_color = getenv("AJI_VK_CPUCOLOR") == nullptr;
     c->gpu_incolor = getenv("AJI_VK_GPUINCOLOR") != nullptr;   // GPU-resident in-color (opt-in; frees the filter thread)
+    // packed u8/u16 download is the default (bit-identical: the pack kernel truncates
+    // exactly like the host casts it replaces, verified by frame byte-compare);
+    // AJI_VK_PACKED_DL=0 reverts to the fp32 download + host cast loop.
+    if (const char* pe = getenv("AJI_VK_PACKED_DL")) c->packed_dl = atoi(pe) != 0;
     c->rife_model_dir = p->rife_model_dir ? p->rife_model_dir : "";   // dir with rife_v*.param/.bin (NULL disables RIFE)
 
     if (p->conf_path && p->conf_path[0]) {
