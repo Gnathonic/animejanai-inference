@@ -1341,6 +1341,14 @@ AJI_EXPORT int aji_rife_factor(aji_ctx* c, int* num, int* den) {
 AJI_EXPORT int aji_rife_before_upscale(aji_ctx* c) {
     return (c && c->rife.enabled && c->rife.before_upscale) ? 1 : 0;
 }
+// Pre-RIFE downscale (API v8): not implemented on this backend — rife-first
+// chains interpolate at source resolution and any chain resize happens
+// in-chain, exactly the pre-v8 behavior. Returning 0 tells the caller to feed
+// source-resolution frames as before; aji_resize is then never called.
+AJI_EXPORT int aji_pre_resize(aji_ctx*, int*, int*) { return 0; }
+AJI_EXPORT int aji_resize(aji_ctx*, const aji_frame*, const aji_frame*, void*) {
+    return AJI_ERR;  // only meaningful after aji_pre_resize() returns 1
+}
 // Returns 1 exactly once when a background engine compile has finished (success or
 // failure); the filter then re-runs aji_configure, which finds the now-cached engine
 // (or, on failure, the failed-set marker -> passthrough). 0 if no build, still running,

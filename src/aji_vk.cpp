@@ -1279,6 +1279,15 @@ AJI_EXPORT int aji_rife_before_upscale(aji_ctx* c) {
     return (c && c->rife.enabled && c->rife.before_upscale) ? 1 : 0;
 }
 
+// Pre-RIFE downscale (API v8): not implemented on this backend — rife-first
+// chains interpolate at source resolution and any chain resize happens
+// in-chain, exactly the pre-v8 behavior. Returning 0 tells the caller to feed
+// source-resolution frames as before; aji_resize is then never called.
+AJI_EXPORT int aji_pre_resize(aji_ctx*, int*, int*) { return 0; }
+AJI_EXPORT int aji_resize(aji_ctx*, const aji_frame*, const aji_frame*, void*) {
+    return AJI_ERR;  // only meaningful after aji_pre_resize() returns 1
+}
+
 // aji_vk loads RIFE synchronously (ncnn has no engine-compile step), so there is never a
 // deferred build to report.
 AJI_EXPORT int aji_poll(aji_ctx*) { return 0; }

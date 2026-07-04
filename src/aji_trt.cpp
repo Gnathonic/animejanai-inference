@@ -20,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <set>
 #include <string>
@@ -48,6 +49,124 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+#ifdef _WIN32
+std::wstring widen_utf8(const std::string &s)
+{
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    if (n <= 0)
+        return std::wstring();
+    std::wstring w((size_t)n - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+    return w;
+}
+
+std::wstring win_long_path(const std::string &path)
+{
+    std::wstring w = widen_utf8(path);
+    if (w.empty() || w.rfind(L"\\\\?\\", 0) == 0 ||
+        w.rfind(L"\\\\.\\", 0) == 0)
+        return w;
+
+    DWORD need = GetFullPathNameW(w.c_str(), 0, nullptr, nullptr);
+    if (need > 0) {
+        std::vector<wchar_t> full(need);
+        DWORD n = GetFullPathNameW(w.c_str(), need, full.data(), nullptr);
+        if (n > 0 && n < need)
+            w.assign(full.data(), n);
+    }
+
+    if (w.rfind(L"\\\\", 0) == 0)
+        return L"\\\\?\\UNC" + w.substr(1);
+    if (w.size() >= 2 && w[1] == L':')
+        return L"\\\\?\\" + w;
+    return w;
+}
+
+bool file_exists(const std::string &path)
+{
+    DWORD attrs = GetFileAttributesW(win_long_path(path).c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+void remove_file(const std::string &path)
+{
+    DeleteFileW(win_long_path(path).c_str());
+}
+
+bool read_file_bytes(const std::string &path, std::vector<char> *out)
+{
+    HANDLE h = CreateFileW(win_long_path(path).c_str(), GENERIC_READ,
+                           FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(h, &size) || size.QuadPart < 0 ||
+        size.QuadPart > SIZE_MAX) {
+        CloseHandle(h);
+        return false;
+    }
+    out->resize((size_t)size.QuadPart);
+    char *dst = out->data();
+    size_t left = out->size();
+    while (left > 0) {
+        DWORD chunk = (DWORD)std::min<size_t>(left, 1u << 30);
+        DWORD got = 0;
+        if (!ReadFile(h, dst, chunk, &got, nullptr) || got == 0) {
+            CloseHandle(h);
+            return false;
+        }
+        dst += got;
+        left -= got;
+    }
+    CloseHandle(h);
+    return true;
+}
+
+void append_file_text(const std::string &path, const std::string &text)
+{
+    HANDLE h = CreateFileW(win_long_path(path).c_str(), FILE_APPEND_DATA,
+                           FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    DWORD written = 0;
+    WriteFile(h, text.data(), (DWORD)text.size(), &written, nullptr);
+    CloseHandle(h);
+}
+#else
+bool file_exists(const std::string &path)
+{
+    std::error_code ec;
+    return fs::is_regular_file(path, ec);
+}
+
+void remove_file(const std::string &path)
+{
+    std::error_code ec;
+    fs::remove(path, ec);
+}
+
+bool read_file_bytes(const std::string &path, std::vector<char> *out)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+        return false;
+    out->assign(std::istreambuf_iterator<char>(f),
+                std::istreambuf_iterator<char>());
+    return true;
+}
+
+void append_file_text(const std::string &path, const std::string &text)
+{
+    if (FILE *f = fopen(path.c_str(), "a")) {
+        fwrite(text.data(), 1, text.size(), f);
+        fclose(f);
+    }
+}
+#endif
 
 // TRT 11: strongly-typed is the default (--stronglyTyped is a no-op), and sanitize_settings_trt11
 // strips --inputIOFormats/--outputIOFormats/--tacticSources anyway (types come from the network;
@@ -178,6 +297,19 @@ struct aji_ctx {
     aji_plan *pre_plan = nullptr, *post_plan = nullptr;
     int pre_key[4] = {0}, post_key[4] = {0};
 
+    // Pre-RIFE downscale (rife-first only): the first model's "resize before
+    // upscale" is hoisted ahead of RIFE so interpolation runs on the smaller
+    // frame. work_w/h is the post-resize ("work") resolution at which RIFE and
+    // the upscale chain run; the filter applies the downscale to source frames
+    // via aji_resize. aji_resize keeps its OWN pre/post plans so it doesn't
+    // thrash run_chain's per-frame plan keys.
+    bool has_pre_resize = false;
+    int pre_src_w = 0, pre_src_h = 0;               // aji_resize input dims
+    int work_w = 0, work_h = 0;                      // aji_resize output dims
+    aji_plan *pre_resize_plan = nullptr;            // source -> work, Spline36
+    aji_plan *pr_pre_plan = nullptr, *pr_post_plan = nullptr;
+    int pr_pre_key[4] = {0}, pr_post_key[4] = {0};
+
     // RIFE (phase 1.5): interpolation between already-upscaled frames,
     // replicating animejanai_core's pad/crop + rife_cuda.py's bilinear 709
     // conversions + the vsmlrt v1 11-channel model input. Geometry state
@@ -289,6 +421,18 @@ std::string engine_path_for(const std::string &model_dir,
         .string();
 }
 
+std::string short_engine_path_for(const std::string &model_dir,
+                                  const std::string &onnx_name,
+                                  const std::string &settings)
+{
+    char model_hash[9];
+    snprintf(model_hash, sizeof(model_hash), "%08x", crc32_z(onnx_name));
+    return (fs::path(model_dir) /
+            ("aji-" + std::string(model_hash) + "." +
+             std::to_string(crc32_z(settings)) + engine_suffix()))
+        .string();
+}
+
 void clean_stale_engines(aji_ctx *c)
 {
     const std::string suffix = engine_suffix();
@@ -346,6 +490,35 @@ std::string shapes_label(const std::string &settings)
     return !mx.empty() ? mx : mn;
 }
 
+// Parse the W,H of a trtexec shape flag (--minShapes/--optShapes/--maxShapes,
+// format input:NxCxHxW) out of `settings`. Returns true + fills w/h when the
+// flag is present. Mirrors shapes_label's digit walk.
+bool parse_shape_wh(const std::string &settings, const char *key, int *w, int *h)
+{
+    size_t p = settings.find(key);
+    if (p == std::string::npos)
+        return false;
+    p = settings.find(':', p);
+    if (p == std::string::npos)
+        return false;
+    long v[8];
+    int n = 0;
+    size_t i = p + 1;
+    while (n < 8 && i < settings.size() &&
+           isdigit((unsigned char)settings[i])) {
+        v[n++] = strtol(settings.c_str() + i, nullptr, 10);
+        while (i < settings.size() && isdigit((unsigned char)settings[i]))
+            i++;
+        if (i < settings.size() && settings[i] == 'x')
+            i++;
+    }
+    if (n < 2)
+        return false;
+    *w = (int)v[n - 1];  // ...HxW
+    *h = (int)v[n - 2];
+    return true;
+}
+
 // Everything a build needs, with no aji_ctx references, so it can run on a
 // background thread.
 struct BuildSpec {
@@ -365,9 +538,11 @@ int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
 {
 #ifdef _WIN32
     SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
-    HANDLE log = CreateFileA(spec.log_path.c_str(), GENERIC_WRITE,
+    HANDLE log = CreateFileW(win_long_path(spec.log_path).c_str(), GENERIC_WRITE,
                              FILE_SHARE_READ, &sa, CREATE_ALWAYS,
                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (log == INVALID_HANDLE_VALUE)
+        return -1;
     STARTUPINFOA si = {};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
@@ -414,14 +589,16 @@ int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
 bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child)
 {
     int rc = run_build_process(spec, child);
+    // upstream's path helpers (wide-char-safe on Windows) + our atomic
+    // build_path -> engine_path rename publish
     std::error_code ec;
-    if (rc != 0 || !fs::exists(spec.build_path)) {
-        fs::remove(spec.build_path, ec);
-        if (FILE *f = fopen(spec.log_path.c_str(), "a")) {
-            fprintf(f, "\n[aji] build process exit code: %d (0x%x)\n", rc,
-                    (unsigned)rc);
-            fclose(f);
-        }
+    if (rc != 0 || !file_exists(spec.build_path)) {
+        remove_file(spec.build_path);
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+                 "\n[aji] build process exit code: %d (0x%x)\n", rc,
+                 (unsigned)rc);
+        append_file_text(spec.log_path, msg);
         return false;
     }
     // Atomic publish: a same-directory rename is atomic, so the final cache
@@ -492,7 +669,7 @@ bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
 {
     const std::string onnx_path =
         (fs::path(dir ? *dir : c->model_dir) / (onnx_name + ".onnx")).string();
-    if (!fs::exists(onnx_path)) {
+    if (!file_exists(onnx_path)) {
         c->set_error("model not found: %s", onnx_path.c_str());
         return false;
     }
@@ -553,13 +730,11 @@ bool build_engine(aji_ctx *c, const std::string &onnx_name,
 bool load_engine(aji_ctx *c, const std::string &engine_path, ModelEngine *me,
                  int in_w, int in_h, int in_ch = 3)
 {
-    std::ifstream f(engine_path, std::ios::binary);
-    if (!f) {
+    std::vector<char> blob;
+    if (!read_file_bytes(engine_path, &blob)) {
         c->set_error("cannot open engine: %s", engine_path.c_str());
         return false;
     }
-    std::vector<char> blob((std::istreambuf_iterator<char>(f)),
-                           std::istreambuf_iterator<char>());
     me->engine.reset(c->runtime->deserializeCudaEngine(blob.data(), blob.size()));
     if (!me->engine) {
         c->set_error("engine deserialization failed: %s", engine_path.c_str());
@@ -617,6 +792,49 @@ void fit_box(int w, int h, double box_w, double box_h, int *ow, int *oh)
     }
 }
 
+// Fit (w,h) within an arbitrary (box_w, box_h) box preserving aspect, flooring
+// to even so the result never EXCEEDS the box. Unlike fit_box this does not
+// assume a 16:9 box — used to clamp to a dynamic engine's max build shape,
+// where any overshoot would fail enqueue.
+void fit_within(int w, int h, int box_w, int box_h, int *ow, int *oh)
+{
+    double s = std::min((double)box_w / w, (double)box_h / h);
+    *ow = (int)(w * s) & ~1;
+    *oh = (int)(h * s) & ~1;
+}
+
+// Compose the FIRST model's "resize before upscale" target from (w,h): factor
+// then explicit height, exactly as the configure model loop applies them.
+// Returns true + fills (ow,oh) when an explicit resize is set and changes the
+// size (the maxShapes/auto cap is deliberately NOT part of this — only an
+// explicit resize is hoisted ahead of RIFE).
+bool first_resize_target(const AjiModelConf &m, int w, int h, int *ow, int *oh)
+{
+    int cw = w, ch = h;
+    double factor = m.resize_factor_before_upscale;
+    if (m.resize_height_before_upscale != 0)
+        factor = 100;
+    if (factor != 100) {
+        int nw = round_even(cw * factor / 100.0);
+        int nh = round_even(ch * factor / 100.0);
+        if (nw >= 2 && nh >= 2) {
+            cw = nw;
+            ch = nh;
+        }
+    }
+    if (m.resize_height_before_upscale != 0 &&
+        (int)m.resize_height_before_upscale != ch) {
+        int nw, nh;
+        fit_box(cw, ch, m.resize_height_before_upscale * 16.0 / 9.0,
+                m.resize_height_before_upscale, &nw, &nh);
+        cw = nw;
+        ch = nh;
+    }
+    *ow = cw;
+    *oh = ch;
+    return cw != w || ch != h;
+}
+
 bool ensure_buffers(aji_ctx *c, size_t bytes)
 {
     if (bytes <= c->buf_bytes && c->buf[0] && c->buf[1])
@@ -668,55 +886,62 @@ int ensure_engine(aji_ctx *c, const std::string &name,
                   ModelEngine *me, int w, int h, int ch,
                   const std::string *dir = nullptr)
 {
-    bool fresh = false;
-    if (!fs::exists(epath)) {
-        if (c->async_build) {
-            if (c->failed_builds.count(epath)) {
-                // permanent (until reconfigure changes the cache key):
-                // play passthrough instead of failing the filter
-                c->log_steps.push_back(
-                    "Engine build FAILED for " + name + " for " +
-                    shapes_label(settings) + " (see " + epath +
-                    ".build.log); playing without this chain");
-                return 0;
-            }
-            if (c->build_running.load()) {
-                // one build at a time; multi-engine chains cascade through
-                // repeated poll() -> reconfigure cycles
-                c->log_steps.push_back("Building TensorRT engine for " +
-                                       name + " for " +
-                                       shapes_label(settings) +
-                                       " (first play at this resolution)");
-                return 0;
-            }
-            BuildSpec spec;
-            if (!make_build_spec(c, name, settings, epath, dir, &spec))
-                return -1;
-            start_async_build(c, spec);
+    const std::string model_dir = dir ? *dir : c->model_dir;
+    const std::string short_epath = short_engine_path_for(model_dir, name, settings);
+
+    // Backwards compatibility: 3.5.0 and earlier cached engines used the
+    // full ONNX basename in the filename. Try that legacy path first so
+    // upgraders do not rebuild engines that already exist.
+    auto try_cached = [&](const std::string &path) -> int {
+        if (!file_exists(path))
+            return 0;
+        if (load_engine(c, path, me, w, h, ch))
+            return 1;
+        c->verbose("cached engine unusable, rebuilding: %s", path.c_str());
+        remove_file(path);
+        return -1;
+    };
+
+    int cached = try_cached(epath);
+    if (cached == 1)
+        return 1;
+    if (short_epath != epath) {
+        cached = try_cached(short_epath);
+        if (cached == 1)
+            return 1;
+    }
+
+    // New builds use a short filename. This avoids MAX_PATH failures for
+    // portable installs while keeping the model/settings/GPU/TRT cache key.
+    const std::string &build_epath = short_epath;
+    if (c->async_build) {
+        if (c->failed_builds.count(build_epath)) {
+            // permanent (until reconfigure changes the cache key):
+            // play passthrough instead of failing the filter
+            c->log_steps.push_back(
+                "Engine build FAILED for " + name + " for " +
+                shapes_label(settings) + " (see " + build_epath +
+                ".build.log); playing without this chain");
             return 0;
         }
-        if (!build_engine(c, name, settings, epath, dir))
-            return -1;
-        fresh = true;
-    }
-    if (load_engine(c, epath, me, w, h, ch))
-        return 1;
-    if (fresh)
-        return -1;
-    c->verbose("cached engine unusable, rebuilding: %s", epath.c_str());
-    std::error_code ec;
-    fs::remove(epath, ec);
-    if (c->async_build) {
+        if (c->build_running.load()) {
+            // one build at a time; multi-engine chains cascade through
+            // repeated poll() -> reconfigure cycles
+            c->log_steps.push_back("Building TensorRT engine for " +
+                                   name + " for " +
+                                   shapes_label(settings) +
+                                   " (first play at this resolution)");
+            return 0;
+        }
         BuildSpec spec;
-        if (!make_build_spec(c, name, settings, epath, dir, &spec))
+        if (!make_build_spec(c, name, settings, build_epath, dir, &spec))
             return -1;
-        if (!c->build_running.load())
-            start_async_build(c, spec);
+        start_async_build(c, spec);
         return 0;
     }
-    if (!build_engine(c, name, settings, epath, dir))
+    if (!build_engine(c, name, settings, build_epath, dir))
         return -1;
-    return load_engine(c, epath, me, w, h, ch) ? 1 : -1;
+    return load_engine(c, build_epath, me, w, h, ch) ? 1 : -1;
 }
 
 // rife model code -> file basename: 414 -> rife_v4.14, 4141 -> _lite,
@@ -819,7 +1044,14 @@ bool setup_rife(aji_ctx *c, const AjiChainConf *chain, int w, int h,
                  "New Video FPS: %.3f",
                  chain->rife_model, factor, fps * factor);
     }
-    c->log_steps.push_back(buf);
+    // RIFE-first runs after any hoisted pre-RIFE resize but before the upscale
+    // models, so its step goes right after the pre-resize line (if one was
+    // pushed at index 0); the default (rife-after) appends it last.
+    if (chain->rife_before_upscale)
+        c->log_steps.insert(c->log_steps.begin() + (c->has_pre_resize ? 1 : 0),
+                            buf);
+    else
+        c->log_steps.push_back(buf);
     R.enabled = true;
     return true;
 }
@@ -995,6 +1227,13 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
     for (Step &st : c->steps)
         aji_plan_destroy(st.plan);
     c->steps.clear();
+    aji_plan_destroy(c->pre_resize_plan);
+    aji_plan_destroy(c->pr_pre_plan);
+    aji_plan_destroy(c->pr_post_plan);
+    c->pre_resize_plan = c->pr_pre_plan = c->pr_post_plan = nullptr;
+    c->has_pre_resize = false;
+    c->pre_src_w = c->pre_src_h = 0;
+    c->work_w = c->work_h = 0;
     rife_teardown(c);
     if (c->graph_exec) {
         cudaGraphExecDestroy(c->graph_exec);
@@ -1067,12 +1306,55 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
                                    : c->conf.trt_engine_settings;
 
     int cw = w, ch = h;
+
+    // Pre-RIFE downscale: in rife-first mode, hoist the FIRST model's explicit
+    // "resize before upscale" ahead of RIFE so interpolation runs on the
+    // smaller frame (order: resize -> RIFE -> upscale). The filter applies it
+    // to source frames via aji_resize; the upscale chain then starts here at
+    // the work resolution. Rife-after and no-RIFE paths are unaffected.
+    const bool rife_first_mode = chain->rife && !c->rife_model_dir.empty() &&
+                                 chain->rife_before_upscale;
+    if (rife_first_mode && !chain->models.empty()) {
+        int ww, wh;
+        if (first_resize_target(chain->models[0], w, h, &ww, &wh)) {
+            c->pre_resize_plan = aji_resize_plan_create(w, h, ww, wh);
+            if (!c->pre_resize_plan) {
+                c->set_error("pre-rife resize plan %dx%d -> %dx%d allocation "
+                             "failed", w, h, ww, wh);
+                return AJI_ERR_CUDA;
+            }
+            c->has_pre_resize = true;
+            c->pre_src_w = w;
+            c->pre_src_h = h;
+            c->work_w = ww;
+            c->work_h = wh;
+            cw = ww;
+            ch = wh;
+            char buf[160];
+            snprintf(buf, sizeof(buf),
+                     "Applied Resize Before Upscale: %dx%d (before RIFE)",
+                     ww, wh);
+            c->log_steps.push_back(buf);
+        }
+    }
+    // RIFE-first interpolates at this resolution (work res if a pre-RIFE
+    // downscale was hoisted, else source); the model loop advances cw/ch.
+    const int rife_in_w = cw, rife_in_h = ch;
+
     size_t max_bytes = (size_t)3 * cw * ch * 2;
+    if (c->has_pre_resize)  // source-res RGB also passes through aji_resize
+        max_bytes = std::max(max_bytes, (size_t)3 * w * h * 2);
     bool any_model = false;
 
-    for (const auto &m : chain->models) {
+    for (size_t mi = 0; mi < chain->models.size(); mi++) {
+        const auto &m = chain->models[mi];
+        // model[0]'s explicit "resize before upscale" is hoisted ahead of RIFE
+        // (rife-first) and applied by the filter via aji_resize; suppress it
+        // here so it isn't re-applied as an upscale step. The maxShapes cap
+        // below still guards model[0]'s (work-res) input on dynamic engines.
+        const bool skip_resize = (mi == 0 && c->has_pre_resize);
         double factor = m.resize_factor_before_upscale;
-        if (m.resize_height_before_upscale != 0)
+        if (m.resize_height_before_upscale != 0 || skip_resize)
             factor = 100;
 
         char buf[160];
@@ -1088,7 +1370,7 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
                 c->log_steps.push_back(buf);
             }
         }
-        if (m.resize_height_before_upscale != 0 &&
+        if (!skip_resize && m.resize_height_before_upscale != 0 &&
             (int)m.resize_height_before_upscale != ch) {
             int nw, nh;
             fit_box(cw, ch, m.resize_height_before_upscale * 16.0 / 9.0,
@@ -1100,15 +1382,27 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
                      "New Video Resolution: %dx%d",
                      m.resize_height_before_upscale, cw, ch);
             c->log_steps.push_back(buf);
-        } else if (ch > 1080) {
-            int nw, nh;
-            fit_box(cw, ch, 1920, 1080, &nw, &nh);
-            if (!push_resize_step(c, &cw, &ch, nw, nh))
-                return AJI_ERR_CUDA;
-            snprintf(buf, sizeof(buf),
-                     "Applied Resize to Video Larger than 1080p;    "
-                     "New Video Resolution: %dx%d", cw, ch);
-            c->log_steps.push_back(buf);
+        } else {
+            // Dynamic engines (custom trt_engine_settings carrying --maxShapes)
+            // can't accept an input larger than their build shape, so clamp to
+            // it. Static engines — the default, --optShapes only — are built per
+            // resolution and need no cap; large sources upscale natively. (This
+            // replaces a hard-coded "downscale anything over 1080p", which only
+            // mattered back when every engine was dynamic.)
+            int maxW, maxH;
+            if (parse_shape_wh(settings_tpl, "--maxShapes", &maxW, &maxH) &&
+                (cw > maxW || ch > maxH)) {
+                int nw, nh;
+                fit_within(cw, ch, maxW, maxH, &nw, &nh);
+                if (nw >= 2 && nh >= 2 && (nw != cw || nh != ch)) {
+                    if (!push_resize_step(c, &cw, &ch, nw, nh))
+                        return AJI_ERR_CUDA;
+                    snprintf(buf, sizeof(buf),
+                             "Applied Resize to fit dynamic engine max shape;"
+                             "    New Video Resolution: %dx%d", cw, ch);
+                    c->log_steps.push_back(buf);
+                }
+            }
         }
         max_bytes = std::max(max_bytes, (size_t)3 * cw * ch * 2);
 
@@ -1150,12 +1444,13 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
 
     if (chain->rife) {
         if (!c->rife_model_dir.empty()) {
-            // RIFE-first interpolates the source frames (w, h); the upscale
-            // models then run on every frame. The default interpolates the
-            // already-upscaled frames (cw, ch). aji_infer_rife validates its
-            // inputs against these configured dims either way.
-            const int rw = chain->rife_before_upscale ? w : cw;
-            const int rh = chain->rife_before_upscale ? h : ch;
+            // RIFE-first interpolates at the work resolution (source, or the
+            // hoisted pre-RIFE downscale); the upscale models then run on every
+            // frame. The default (rife-after) interpolates the already-upscaled
+            // frames (cw, ch). aji_infer_rife validates its inputs against these
+            // configured dims either way.
+            const int rw = chain->rife_before_upscale ? rife_in_w : cw;
+            const int rh = chain->rife_before_upscale ? rife_in_h : ch;
             if (!setup_rife(c, chain, rw, rh, fps)) {
                 finalize_log(c);
                 return AJI_ERR_ENGINE;
@@ -1170,17 +1465,22 @@ extern "C" AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
 
     finalize_log(c);
 
-    if (!any_model && c->steps.empty()) {
+    if (!any_model && c->steps.empty() && !c->has_pre_resize) {
         if (out_w) *out_w = w;
         if (out_h) *out_h = h;
-        // chain selected no scaling work; rife (if enabled above) still
-        // interpolates between the passthrough frames
+        // chain selected no scaling work and no pre-RIFE downscale; rife (if
+        // enabled above) still interpolates between the passthrough frames
         return 0;
     }
 
     if (!ensure_buffers(c, max_bytes))
         return AJI_ERR_CUDA;
 
+    // In hoist mode the filter downscales source -> work via aji_resize and
+    // feeds work-res frames to the upscale chain, so the chain's input geometry
+    // is the work resolution (aji_infer validates in->w/h against c->in_w/in_h).
+    c->in_w = c->has_pre_resize ? c->work_w : w;
+    c->in_h = c->has_pre_resize ? c->work_h : h;
     c->out_w = cw;
     c->out_h = ch;
     c->active = true;
@@ -1503,6 +1803,131 @@ static int run_chain(aji_ctx *c, const aji_frame *in, const aji_frame *out,
                        out->stride[1], stream);
     if (err) {
         c->set_error("post-kernel failed: %s", cudaGetErrorString((cudaError_t)err));
+        return AJI_ERR_CUDA;
+    }
+    return AJI_OK;
+}
+
+extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
+{
+    if (!c || !c->has_pre_resize)
+        return 0;
+    if (work_w)
+        *work_w = c->work_w;
+    if (work_h)
+        *work_h = c->work_h;
+    return 1;
+}
+
+// Downscale one source-resolution frame to the work resolution (the rife-first
+// pre-RIFE step), reusing the pre -> resize -> post kernels over c->buf with
+// aji_resize's OWN pre/post plans so it doesn't thrash run_chain's per-frame
+// keys. A trimmed run_chain: no model steps, a single fixed resize.
+extern "C" AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
+                                     const aji_frame *out, void *cu_stream)
+{
+    if (!c || !in || !out)
+        return AJI_ERR;
+    if (!c->has_pre_resize || !c->pre_resize_plan) {
+        c->set_error("aji_resize without a configured pre-RIFE downscale");
+        return AJI_ERR;
+    }
+    if (in->format != AJI_FMT_NV12 && in->format != AJI_FMT_P010 &&
+        in->format != AJI_FMT_YUV444P16) {
+        c->set_error("unsupported input format %d", in->format);
+        return AJI_ERR_FORMAT;
+    }
+    if (out->format != in->format) {
+        c->set_error("aji_resize requires matching in/out formats");
+        return AJI_ERR_FORMAT;
+    }
+    if (in->width != c->pre_src_w || in->height != c->pre_src_h ||
+        out->width != c->work_w || out->height != c->work_h) {
+        c->set_error("aji_resize dims %dx%d->%dx%d do not match configured "
+                     "%dx%d->%dx%d", in->width, in->height, out->width,
+                     out->height, c->pre_src_w, c->pre_src_h, c->work_w,
+                     c->work_h);
+        return AJI_ERR_SHAPE;
+    }
+
+    CtxGuard guard(c->cu_ctx);
+    if (!guard.ok) {
+        c->set_error("cuCtxPushCurrent failed");
+        return AJI_ERR_CUDA;
+    }
+    cudaStream_t stream = (cudaStream_t)cu_stream;
+
+    const aji_csp csp = make_csp(in);
+    const bool in444 = in->format == AJI_FMT_YUV444P16;
+    if (!in444) {
+        const int pkey[4] = {in->format, in->width, in->height, in->siting};
+        if (!c->pr_pre_plan || memcmp(pkey, c->pr_pre_key, sizeof(pkey)) != 0) {
+            aji_plan_destroy(c->pr_pre_plan);
+            c->pr_pre_plan = aji_pre_plan_create(in->format, in->width,
+                                                 in->height, in->siting,
+                                                 AJI_FILTER_SPLINE36);
+            if (!c->pr_pre_plan) {
+                c->set_error("pre-resize pre plan allocation failed");
+                return AJI_ERR_CUDA;
+            }
+            memcpy(c->pr_pre_key, pkey, sizeof(pkey));
+        }
+    }
+
+    int err = in444
+        ? aji_run_pre444(in->width, in->height, in->plane[0], in->stride[0],
+                         in->plane[1], in->stride[1], in->plane[2],
+                         in->stride[2], &csp, c->buf[0], stream)
+        : aji_run_pre(c->pr_pre_plan, in->plane[0], in->stride[0],
+                      in->plane[1], in->stride[1], &csp, c->buf[0], stream);
+    if (err) {
+        c->set_error("pre-resize pre-kernel failed: %s",
+                     cudaGetErrorString((cudaError_t)err));
+        return AJI_ERR_CUDA;
+    }
+
+    err = aji_run_resize(c->pre_resize_plan, c->buf[0], c->buf[1], stream);
+    if (err) {
+        c->set_error("pre-resize kernel failed: %s",
+                     cudaGetErrorString((cudaError_t)err));
+        return AJI_ERR_CUDA;
+    }
+
+    if (out->format == AJI_FMT_YUV444P16) {
+        const aji_csp ocsp = aji_make_csp(AJI_FMT_YUV444P16, in->matrix,
+                                          in->range);
+        int err4 = aji_run_post444(c->work_w, c->work_h, c->buf[1], &ocsp,
+                                   out->plane[0], out->stride[0],
+                                   out->plane[1], out->stride[1],
+                                   out->plane[2], out->stride[2], stream);
+        if (err4) {
+            c->set_error("pre-resize post444 kernel failed: %s",
+                         cudaGetErrorString((cudaError_t)err4));
+            return AJI_ERR_CUDA;
+        }
+        return AJI_OK;
+    }
+
+    const int qkey[4] = {out->format, c->work_w, c->work_h, AJI_SITING_LEFT};
+    if (!c->pr_post_plan || memcmp(qkey, c->pr_post_key, sizeof(qkey)) != 0) {
+        aji_plan_destroy(c->pr_post_plan);
+        c->pr_post_plan = aji_post_plan_create(out->format, c->work_w,
+                                               c->work_h, AJI_SITING_LEFT,
+                                               AJI_FILTER_SPLINE36);
+        if (!c->pr_post_plan) {
+            c->set_error("pre-resize post plan allocation failed");
+            return AJI_ERR_CUDA;
+        }
+        memcpy(c->pr_post_key, qkey, sizeof(qkey));
+    }
+
+    const aji_csp ocsp = aji_make_csp(out->format, in->matrix, in->range);
+    err = aji_run_post(c->pr_post_plan, c->buf[1], &ocsp,
+                       out->plane[0], out->stride[0], out->plane[1],
+                       out->stride[1], stream);
+    if (err) {
+        c->set_error("pre-resize post-kernel failed: %s",
+                     cudaGetErrorString((cudaError_t)err));
         return AJI_ERR_CUDA;
     }
     return AJI_OK;
@@ -1876,6 +2301,9 @@ extern "C" AJI_EXPORT void aji_destroy(aji_ctx **pc)
         c->steps.clear();
         aji_plan_destroy(c->pre_plan);
         aji_plan_destroy(c->post_plan);
+        aji_plan_destroy(c->pre_resize_plan);
+        aji_plan_destroy(c->pr_pre_plan);
+        aji_plan_destroy(c->pr_post_plan);
         rife_teardown(c);
         if (c->graph_exec)
             cudaGraphExecDestroy(c->graph_exec);

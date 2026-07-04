@@ -44,6 +44,8 @@ struct aji_backend {
     int (*max_in_flight)(aji_ctx *);   // optional (older backends lack it -> NULL)
     int (*rife_factor)(aji_ctx *, int *, int *);
     int (*rife_before_upscale)(aji_ctx *);
+    int (*pre_resize)(aji_ctx *, int *, int *);
+    int (*resize)(aji_ctx *, const aji_frame *, const aji_frame *, void *);
     int (*poll)(aji_ctx *);
     int (*infer_rife)(aji_ctx *, const aji_frame *, const aji_frame *,
                       double, const aji_frame *, void *);
@@ -166,6 +168,8 @@ static bool load_backend(const char *stem, aji_backend *be,
     // (the field stays NULL and the exported wrapper returns a conservative default).
     *(void **)&be->max_in_flight = lib_sym(be->lib, "aji_max_in_flight");
     SYM(rife_before_upscale, "aji_rife_before_upscale");
+    SYM(pre_resize,   "aji_pre_resize");
+    SYM(resize,       "aji_resize");
     SYM(poll,         "aji_poll");
     SYM(infer_rife,   "aji_infer_rife");
     SYM(last_error,   "aji_last_error");
@@ -285,6 +289,17 @@ extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)
 extern "C" AJI_EXPORT int aji_rife_before_upscale(aji_ctx *c)
 {
     return c->be.rife_before_upscale(c->inner);
+}
+
+extern "C" AJI_EXPORT int aji_pre_resize(aji_ctx *c, int *work_w, int *work_h)
+{
+    return c->be.pre_resize(c->inner, work_w, work_h);
+}
+
+extern "C" AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
+                                     const aji_frame *out, void *cu_stream)
+{
+    return c->be.resize(c->inner, in, out, cu_stream);
 }
 
 extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)
