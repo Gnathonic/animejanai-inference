@@ -14,14 +14,27 @@
 #pragma once
 #include <migraphx/migraphx.hpp>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 
-// The .mxr cache key: <onnx>.<w>x<h>.c<channels>.dev.mlir.fp16.mxr
+// Opt-in exhaustive kernel tuning (AJI_ROCM_EXHAUSTIVE_TUNE=1): MIGraphX
+// benchmarks every candidate kernel config instead of the heuristic pick.
+// Default OFF — compile time rises from ~1-2 min to many minutes per engine
+// for an uncertain (0-15%) inference gain; the SPAN convs already route
+// through self-tuning MLIR. Read here (not just in the compile) so the cache
+// KEY changes too: a tuned engine must never silently reuse an untuned .mxr.
+inline bool mxr_exhaustive_tune() {
+    const char* e = getenv("AJI_ROCM_EXHAUSTIVE_TUNE");
+    return e && *e && *e != '0';
+}
+
+// The .mxr cache key: <onnx>.<w>x<h>.c<channels>.dev.mlir.fp16[.exh].mxr
 inline std::string mxr_cache_path(const std::string& onnx, int w, int h, int channels = 3) {
     return onnx + "." + std::to_string(w) + "x" + std::to_string(h)
-           + ".c" + std::to_string(channels) + ".dev.mlir.fp16.mxr";
+           + ".c" + std::to_string(channels) + ".dev.mlir.fp16"
+           + (mxr_exhaustive_tune() ? ".exh" : "") + ".mxr";
 }
 inline bool mxr_cached(const std::string& onnx, int w, int h, int channels = 3) {
     std::ifstream probe(mxr_cache_path(onnx, w, h, channels), std::ios::binary);
@@ -49,6 +62,8 @@ inline bool aji_rocm_compile_mxr(const std::string& onnx_path, int in_w, int in_
         auto prog = migraphx::parse_onnx(onnx_path.c_str(), oo);
         migraphx::quantize_fp16(prog);
         migraphx::compile_options co; co.set_offload_copy(false);  // device-resident
+        if (mxr_exhaustive_tune())
+            co.set_exhaustive_tune_flag(true);     // opt-in; see mxr_exhaustive_tune()
         prog.compile(migraphx::target("gpu"), co);
         const std::string cache = mxr_cache_path(onnx_path, in_w, in_h, in_channels);
         const std::string tmp = cache + ".tmp." + std::to_string(in_w) + "x" + std::to_string(in_h);

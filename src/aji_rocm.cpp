@@ -1015,8 +1015,14 @@ static int run_chain_gpu(aji_ctx* c, RgbMat& rgb_in, const aji_frame* out,
             std::lock_guard<std::mutex> lk(c->gpu_eval_mtx);
             // eval→gpu-out-color→final sync all on the default stream: one lock covers both.
             auto outs = nm->prog.eval(pp);   // inference graph (MIGraphX), not code-eval
-            if (hipDeviceSynchronize() != hipSuccess) { if (errmsg) *errmsg = "eval sync failed"; return AJI_ERR; }
-            if (getenv("AJI_ROCM_TIMING")) { static double te=0; static long ne=0;
+            // No device-wide sync here: the out-color kernels below enqueue on the
+            // same (default) stream after the eval, and the final sync at the end
+            // of this block covers completion before the D2H. get_shape() below is
+            // compiled-static metadata, not a device read. AJI_ROCM_TIMING keeps
+            // the sync so its eval number stays exec-time, not enqueue-time.
+            if (getenv("AJI_ROCM_TIMING")) {
+                if (hipDeviceSynchronize() != hipSuccess) { if (errmsg) *errmsg = "eval sync failed"; return AJI_ERR; }
+                static double te=0; static long ne=0;
                 te += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_ge).count();
                 if (++ne % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/eval] eval+sync=%.1fms\n", te/ne); }
             auto oshape = outs[0].get_shape();

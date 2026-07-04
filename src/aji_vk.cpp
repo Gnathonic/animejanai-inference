@@ -135,6 +135,12 @@ struct aji_ctx {
 
     ColorCtx color;
 
+    // Pooled host RGB input Mats (frame-sized; filter-thread alloc, worker-thread
+    // release). PoolAllocator locks internally so the cross-thread free is safe;
+    // pooling stops the ~24MB-per-frame mmap churn — the same stutter class the
+    // Scratch reuse below fixed for the plain vectors.
+    ncnn::PoolAllocator host_pool;
+
     // Per-frame CPU-color scratch, reused across frames. Allocating these (~20MB
     // at 960x720) every frame sends each large block through mmap/munmap, so every
     // frame re-faults its pages — a periodic cost that shows up as playback
@@ -222,7 +228,10 @@ struct aji_ctx {
         bool before_upscale = true;
         bool enabled = false, loaded = false;
         std::vector<float> assembly;               // 11*plane fp32 staging (consts ch7-10 filled once)
-        void reset() { model.reset(); assembly.clear(); enabled = false; loaded = false; }
+        ncnn::Mat in_mat;                          // reused 11-ch model input (create keeps same-dims storage)
+        std::vector<float> rgb;                    // reused 3*plane output staging (resize keeps capacity)
+        void reset() { model.reset(); assembly.clear(); in_mat.release(); rgb.clear();
+                       enabled = false; loaded = false; }
     } rife;
 
     std::string err, log;
@@ -492,7 +501,7 @@ static int gpu_pre(aji_ctx* c, int W, int H, int format, int matrix, int range, 
                 u += w * t0u[(size_t)s * W + x]; v += w * t0v[(size_t)s * W + x]; }
             t1u[(size_t)y * W + x] = u; t1v[(size_t)y * W + x] = v;
         }
-    rgb_out.create(W, H, 3);
+    rgb_out.create(W, H, 3, 4u, &c->host_pool);
     float* Rp = rgb_out.channel(0); float* Gp = rgb_out.channel(1); float* Bp = rgb_out.channel(2);
     const float kg = 1.0f - csp.kr - csp.kb;
     #pragma omp parallel for schedule(static) num_threads(NT)
@@ -953,19 +962,27 @@ static int run_gpu_post(aji_ctx* c, aji_ctx::GpBuf& b, ncnn::VkAllocator* blob, 
         for(long i=0;i<t;i++){float v=yf[i]; s+=v; if(v<mn)mn=v; if(v>mx)mx=v; if(v!=0)nz++;}
         fprintf(stderr,"[gp Yout] mean=%.2f min=%.1f max=%.1f nonzero=%.1f%% | oy.dims=%d w=%d h=%d ep=%d\n",s/t,mn,mx,100.0*nz/t,b.oy.dims,b.oy.w,b.oy.h,b.oy.elempack); } }
 
-    // pack the already-quantized fp32 Y / interleaved-UV to the host out planes
+    // pack the already-quantized fp32 Y / interleaved-UV to the host out planes.
+    // Rows write disjoint memory -> bit-exact (same guarantee as the gpu_pre/
+    // gpu_post row loops). W workers can pack concurrently, so cap the per-worker
+    // width to keep the whole box at ~nthreads total.
+    const int NTp = std::max(1, c->nthreads / std::max(1, c->num_workers));
     const float* yf = (const float*)b.oy.data; const float* uvf = (const float*)b.ouv.data;
     if (out_format == AJI_FMT_P010) {
         uint16_t* yp = (uint16_t*)out->plane[0]; uint16_t* uvp = (uint16_t*)out->plane[1];
         ptrdiff_t ys = out->stride[0] ? out->stride[0] : (ptrdiff_t)W2 * 2;
         ptrdiff_t uvs = out->stride[1] ? out->stride[1] : (ptrdiff_t)cw2 * 2 * 2;
+        #pragma omp parallel for schedule(static) num_threads(NTp)
         for (int y = 0; y < H2; y++) { uint16_t* row = (uint16_t*)((char*)yp + (ptrdiff_t)y * ys); for (int x = 0; x < W2; x++) row[x] = (uint16_t)yf[(size_t)y * W2 + x]; }
+        #pragma omp parallel for schedule(static) num_threads(NTp)
         for (int y = 0; y < ch2; y++) { uint16_t* row = (uint16_t*)((char*)uvp + (ptrdiff_t)y * uvs); for (int x = 0; x < cw2 * 2; x++) row[x] = (uint16_t)uvf[(size_t)y * cw2 * 2 + x]; }
     } else {
         uint8_t* yp = (uint8_t*)out->plane[0]; uint8_t* uvp = (uint8_t*)out->plane[1];
         ptrdiff_t ys = out->stride[0] ? out->stride[0] : (ptrdiff_t)W2;
         ptrdiff_t uvs = out->stride[1] ? out->stride[1] : (ptrdiff_t)cw2 * 2;
+        #pragma omp parallel for schedule(static) num_threads(NTp)
         for (int y = 0; y < H2; y++) { uint8_t* row = yp + (ptrdiff_t)y * ys; for (int x = 0; x < W2; x++) row[x] = (uint8_t)yf[(size_t)y * W2 + x]; }
+        #pragma omp parallel for schedule(static) num_threads(NTp)
         for (int y = 0; y < ch2; y++) { uint8_t* row = uvp + (ptrdiff_t)y * uvs; for (int x = 0; x < cw2 * 2; x++) row[x] = (uint8_t)uvf[(size_t)y * cw2 * 2 + x]; }
     }
     if (kTiming) { static double sg=0,sk=0; static long sn=0;
@@ -1145,13 +1162,17 @@ AJI_EXPORT int aji_infer(aji_ctx* c, const aji_frame* in, const aji_frame* out, 
         std::vector<float>& Vf = c->scratch.Vf; Vf.resize((size_t)cw * ch);
         ptrdiff_t ys = in->stride[0] ? in->stride[0] : (ptrdiff_t)W * bpp;
         ptrdiff_t uvs = in->stride[1] ? in->stride[1] : (ptrdiff_t)cw * 2 * bpp;
+        // rows write disjoint memory -> bit-exact (matches the gpu_pre row loops)
+        const int NTu = c->nthreads;
         if (format == AJI_FMT_P010) {
             const uint8_t* yb = (const uint8_t*)in->plane[0];
             const uint8_t* uvb = (const uint8_t*)in->plane[1];
+            #pragma omp parallel for schedule(static) num_threads(NTu)
             for (int y = 0; y < H; y++) {
                 const uint16_t* row = (const uint16_t*)(yb + (ptrdiff_t)y * ys);
                 for (int x = 0; x < W; x++) Yf[(size_t)y * W + x] = (float)row[x];
             }
+            #pragma omp parallel for schedule(static) num_threads(NTu)
             for (int y = 0; y < ch; y++) {
                 const uint16_t* row = (const uint16_t*)(uvb + (ptrdiff_t)y * uvs);
                 for (int x = 0; x < cw; x++) { Uf[(size_t)y * cw + x] = (float)row[2*x]; Vf[(size_t)y * cw + x] = (float)row[2*x+1]; }
@@ -1159,10 +1180,12 @@ AJI_EXPORT int aji_infer(aji_ctx* c, const aji_frame* in, const aji_frame* out, 
         } else {
             const uint8_t* yb = (const uint8_t*)in->plane[0];
             const uint8_t* uvb = (const uint8_t*)in->plane[1];
+            #pragma omp parallel for schedule(static) num_threads(NTu)
             for (int y = 0; y < H; y++) {
                 const uint8_t* row = yb + (ptrdiff_t)y * ys;
                 for (int x = 0; x < W; x++) Yf[(size_t)y * W + x] = (float)row[x];
             }
+            #pragma omp parallel for schedule(static) num_threads(NTu)
             for (int y = 0; y < ch; y++) {
                 const uint8_t* row = uvb + (ptrdiff_t)y * uvs;
                 for (int x = 0; x < cw; x++) { Uf[(size_t)y * cw + x] = (float)row[2*x]; Vf[(size_t)y * cw + x] = (float)row[2*x+1]; }
@@ -1334,7 +1357,9 @@ AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame* a, const aji_frame* b
 
     // 4. Run the RIFE net on ncnn-Vulkan: 11-ch planar fp32 in -> 3-ch RGB out. ncnn does the
     // fp32->fp16 cast, upload, GPU eval (warps via gridsample_vulkan) and download.
-    ncnn::Mat in(pw, ph, 11);
+    if (R.in_mat.dims != 3 || R.in_mat.w != pw || R.in_mat.h != ph || R.in_mat.c != 11)
+        R.in_mat.create(pw, ph, 11);               // reused across frames (per-frame alloc = pacing churn)
+    ncnn::Mat& in = R.in_mat;
     for (int k = 0; k < 11; ++k) memcpy(in.channel(k), R.assembly.data() + (size_t)k * plane, plane * sizeof(float));
     ncnn::Mat o;
     {
@@ -1353,7 +1378,7 @@ AJI_EXPORT int aji_infer_rife(aji_ctx* c, const aji_frame* a, const aji_frame* b
     }
     ncnn::Mat o1;
     if (o.elempack != 1) ncnn::convert_packing(o, o1, 1); else o1 = o;
-    std::vector<float> rgb(3 * plane);
+    std::vector<float>& rgb = R.rgb; rgb.resize(3 * plane);
     for (int k = 0; k < 3; ++k) memcpy(rgb.data() + (size_t)k * plane, o1.channel(k), plane * sizeof(float));
     rife_cpu::rgb_planes_to_yuv420(rgb.data(), R.g, *(aji_frame*)out, (aji_range)a->range);
 
