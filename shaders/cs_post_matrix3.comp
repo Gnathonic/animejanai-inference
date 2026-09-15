@@ -1,0 +1,20 @@
+#version 450
+layout(local_size_x = 32, local_size_y = 8) in;
+// model output is fp16 ep1 (2 fp16 per uint); decode with core unpackHalf2x16.
+layout(binding = 0) readonly  buffer RGB  { uint rgb[]; };
+layout(binding = 1) writeonly buffer Uf   { float uf[]; };
+layout(binding = 2) writeonly buffer Vf   { float vf[]; };
+layout(binding = 3) writeonly buffer Yout { float yout[]; };
+layout(push_constant) uniform parameter { int w; int h; float kr; float kb; float yoff; float yscale; float qdiv; float qmax; } p;
+float h16(int i){ return unpackHalf2x16(rgb[i>>1])[i&1]; }
+float quant(float v, float qd, float qm){ return min(max(roundEven(v / qd), 0.0), qm) * qd; }
+void main(){
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= p.w || y >= p.h) return;
+    int plane = p.w*p.h, idx = y*p.w + x;
+    float r = h16(idx), g = h16(plane+idx), b = h16(2*plane+idx);
+    float Y = p.kr*r + (1.0 - p.kr - p.kb)*g + p.kb*b;
+    uf[idx] = (b - Y) / (2.0*(1.0 - p.kb));
+    vf[idx] = (r - Y) / (2.0*(1.0 - p.kr));
+    yout[idx] = quant(Y * p.yscale + p.yoff, p.qdiv, p.qmax);
+}

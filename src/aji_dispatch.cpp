@@ -41,6 +41,7 @@ struct aji_backend {
     int (*wait)(aji_ctx *, uint64_t);
     const char *(*current_log)(aji_ctx *);
     int (*scale_factor)(aji_ctx *);
+    int (*max_in_flight)(aji_ctx *);   // optional (older backends lack it -> NULL)
     int (*rife_factor)(aji_ctx *, int *, int *);
     int (*rife_before_upscale)(aji_ctx *);
     int (*pre_resize)(aji_ctx *, int *, int *);
@@ -128,8 +129,10 @@ static void lib_close(aji_lib lib)
 static bool load_backend(const char *stem, aji_backend *be,
                          std::string *err)
 {
-#ifdef _WIN32
+#if defined(_WIN32)
     std::string path = own_dir() + "\\" + stem + ".dll";
+#elif defined(__APPLE__)
+    std::string path = own_dir() + "/lib" + stem + ".dylib";
 #else
     std::string path = own_dir() + "/lib" + stem + ".so";
 #endif
@@ -163,6 +166,9 @@ static bool load_backend(const char *stem, aji_backend *be,
     SYM(current_log,  "aji_current_log");
     SYM(scale_factor, "aji_scale_factor");
     SYM(rife_factor,  "aji_rife_factor");
+    // aji_max_in_flight is OPTIONAL: a backend built before it existed still loads
+    // (the field stays NULL and the exported wrapper returns a conservative default).
+    *(void **)&be->max_in_flight = lib_sym(be->lib, "aji_max_in_flight");
     SYM(rife_before_upscale, "aji_rife_before_upscale");
     SYM(pre_resize,   "aji_pre_resize");
     SYM(resize,       "aji_resize");
@@ -174,21 +180,22 @@ static bool load_backend(const char *stem, aji_backend *be,
     return true;
 }
 
-extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
-{
-    if (!params || params->api_version != AJI_API_VERSION)
-        return nullptr;
+/* Map the conf's [global] backend= value to the sibling library stem and the short
+ * key reported by aji_backend_probe(). Direct mode (no conf) is the TRT harness path. */
+struct backend_choice { const char *stem; const char *key; };
 
-    /* 3.3.x semantics: backend lives in [global] of animejanai.conf;
-     * direct mode (no conf) is the TRT harness path */
+static backend_choice resolve_backend(const char *conf_path, std::string *backend_out,
+                                      aji_log_fn log, void *log_opaque)
+{
+    /* 3.3.x semantics: backend lives in [global] of animejanai.conf */
     std::string backend = "TensorRT";
-    if (params->conf_path) {
+    if (conf_path) {
         AjiConf conf;
         std::string err;
-        if (aji_conf_load(params->conf_path, &conf, &err))
+        if (aji_conf_load(conf_path, &conf, &err))
             backend = conf.backend;
-        else
-            logf_to(params->log, params->log_opaque, 2,
+        else if (log)
+            logf_to(log, log_opaque, 2,
                     "conf parse failed (%s), using TensorRT", err.c_str());
     }
 
@@ -196,14 +203,36 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     for (char ch : backend)
         lower.push_back((char)tolower((unsigned char)ch));
 
-    const char *stem = "aji_trt";
+    backend_choice c = {"aji_trt", "trt"};
     if (lower == "directml") {
-        stem = "aji_dml";
-    } else if (lower == "ncnn") {
-        logf_to(params->log, params->log_opaque, 2,
-                "backend=NCNN is retired; using DirectML instead");
-        stem = "aji_dml";
+        c = {"aji_dml", "dml"};
+    } else if (lower == "rocm") {
+        /* AMD ROCm/MIGraphX backend — the fastest Linux/AMD upscale path */
+        c = {"aji_rocm", "rocm"};
+    } else if (lower == "vulkan" || lower == "ncnn") {
+        /* ncnn-Vulkan backend — the portable path (any Vulkan GPU, incl. MoltenVK on
+         * macOS; no ROCm install required), and ~2.4x faster than ROCm on the
+         * warp-heavy RIFE pipeline */
+        c = {"aji_vk", "vk"};
     }
+    if (backend_out) *backend_out = backend;
+    return c;
+}
+
+extern "C" AJI_EXPORT const char *aji_backend_probe(const char *conf_path)
+{
+    return resolve_backend(conf_path, nullptr, nullptr, nullptr).key;
+}
+
+extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
+{
+    if (!params || params->api_version != AJI_API_VERSION)
+        return nullptr;
+
+    std::string backend;
+    const backend_choice choice = resolve_backend(params->conf_path, &backend,
+                                                  params->log, params->log_opaque);
+    const char *stem = choice.stem;
 
     aji_backend be = {};
     std::string err;
@@ -264,6 +293,14 @@ extern "C" AJI_EXPORT const char *aji_current_log(aji_ctx *c)
 extern "C" AJI_EXPORT int aji_scale_factor(aji_ctx *c)
 {
     return c->be.scale_factor(c->inner);
+}
+
+extern "C" AJI_EXPORT int aji_max_in_flight(aji_ctx *c)
+{
+    // Optional in the backend: a lib built before this symbol existed leaves the
+    // pointer NULL; return 0 ("unknown") so the caller uses its own conservative
+    // default rather than crashing.
+    return (c && c->be.max_in_flight) ? c->be.max_in_flight(c->inner) : 0;
 }
 
 extern "C" AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den)

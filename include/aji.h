@@ -171,6 +171,24 @@ AJI_EXPORT int aji_done(aji_ctx *c, uint64_t ticket);
  * loss/timeout. */
 AJI_EXPORT int aji_wait(aji_ctx *c, uint64_t ticket);
 
+/* Max frames the caller may keep in flight (submitted via aji_infer but not yet
+ * aji_wait'd) before aji_infer back-pressures/blocks — i.e. the backend's engine
+ * ring size. The pipelined filter MUST clamp its queue depth to this: submitting
+ * more than the ring holds before collecting deadlocks (the submit fills the ring
+ * and aji_infer blocks for a free slot before the caller ever waits one). Values:
+ * ncnn-Vulkan 12, TensorRT 8, ROCm/MIGraphX 4. A value <= 0 (or a missing symbol
+ * on an older backend) means "unknown — use a conservative default". */
+AJI_EXPORT int aji_max_in_flight(aji_ctx *c);
+
+/* Which backend library the dispatcher (aji.dll / libaji.so) would load for this
+ * animejanai.conf: "trt", "dml", "rocm" or "vk". NULL conf_path = direct mode =
+ * "trt". Does not load anything. OPTIONAL symbol — the player resolves it with
+ * dlsym/GetProcAddress and must tolerate its absence (older engines); the API
+ * version is unchanged. The mpv filter uses it to take its CUDA software-ingest
+ * path only when the CUDA/TensorRT backend is actually selected, instead of
+ * whenever libcuda happens to be loadable. */
+AJI_EXPORT const char *aji_backend_probe(const char *conf_path);
+
 /* Human-readable description of the active configuration, formatted like
  * currentanimejanai.log (info lines, blank line, numbered steps). Valid
  * after aji_configure() until the next configure/destroy. */

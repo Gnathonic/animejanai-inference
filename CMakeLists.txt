@@ -1,38 +1,55 @@
 cmake_minimum_required(VERSION 3.24)
-project(animejanai-inference LANGUAGES C CXX CUDA)
+project(animejanai-inference LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    # Ship kernels for every supported GPU generation (Turing..Blackwell), NOT
-    # "native": native builds only for the build machine's GPU, so the shipped
-    # binary dies with "no kernel image is available for execution on the device"
-    # on every other architecture (e.g. built on a 5090/sm120 => fails on a
-    # 4090/sm89). The trailing -virtual emits PTX so future archs JIT-compile.
-    # Keep in sync with the TensorRT builder packs (sm75/80/86/89/90/100/120).
-    # Local dev can still override with -DCMAKE_CUDA_ARCHITECTURES=native.
-    set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 89-real 90-real 100-real 120-real 120-virtual)
-endif()
 
-# TensorRT location (default: userland dpkg -x extract on Linux; on Windows
-# pass -DAJI_TRT_ROOT=<dir with nvinfer_10.dll, nvinfer_10.lib, include/>).
-if(WIN32)
-    set(AJI_TRT_ROOT "" CACHE PATH "TensorRT root")
-    set(AJI_TRT_INCLUDE "${AJI_TRT_ROOT}/include")
-    set(AJI_TRT_LIB "${AJI_TRT_ROOT}")
-    set(AJI_NVINFER "nvinfer_10" CACHE STRING
-        "nvinfer import library name (nvinfer_10 / nvinfer_11)")
+# CUDA is optional. The TensorRT backend (aji_trt) and its CUDA harness/parity tools
+# build only when a CUDA toolchain is present; the ROCm/MIGraphX backend (aji_rocm)
+# needs no CUDA either, so this project configures on a plain
+# Linux box with just a C/C++ compiler.
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+    # CMAKE_CUDA_ARCHITECTURES must be set BEFORE the language is enabled (the
+    # upstream layout put it after project(LANGUAGES ... CUDA), where CMake had
+    # already pre-defined it, so the fallback never fired); shipping builds still
+    # pass the list explicitly.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        # Ship kernels for every supported GPU generation (Turing..Blackwell), NOT
+        # "native": native builds only for the build machine's GPU, so the shipped
+        # binary dies with "no kernel image is available for execution on the device"
+        # on every other architecture (e.g. built on a 5090/sm120 => fails on a
+        # 4090/sm89). The trailing -virtual emits PTX so future archs JIT-compile.
+        # Keep in sync with the TensorRT builder packs (sm75/80/86/89/90/100/120).
+        # Local dev can still override with -DCMAKE_CUDA_ARCHITECTURES=native.
+        set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 89-real 90-real 100-real 120-real 120-virtual)
+    endif()
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    set(AJI_HAVE_CUDA ON)
+
+    # TensorRT location (default: userland dpkg -x extract on Linux; on Windows
+    # pass -DAJI_TRT_ROOT=<dir with nvinfer_10.dll, nvinfer_10.lib, include/>).
+    if(WIN32)
+        set(AJI_TRT_ROOT "" CACHE PATH "TensorRT root")
+        set(AJI_TRT_INCLUDE "${AJI_TRT_ROOT}/include")
+        set(AJI_TRT_LIB "${AJI_TRT_ROOT}")
+        set(AJI_NVINFER "nvinfer_10" CACHE STRING
+            "nvinfer import library name (nvinfer_10 / nvinfer_11)")
+    else()
+        set(AJI_TRT_ROOT "$ENV{HOME}/sdk/tensorrt/usr" CACHE PATH "TensorRT root")
+        set(AJI_TRT_INCLUDE "${AJI_TRT_ROOT}/include/x86_64-linux-gnu")
+        set(AJI_TRT_LIB "${AJI_TRT_ROOT}/lib/x86_64-linux-gnu")
+        set(AJI_NVINFER nvinfer)
+    endif()
 else()
-    set(AJI_TRT_ROOT "$ENV{HOME}/sdk/tensorrt/usr" CACHE PATH "TensorRT root")
-    set(AJI_TRT_INCLUDE "${AJI_TRT_ROOT}/include/x86_64-linux-gnu")
-    set(AJI_TRT_LIB "${AJI_TRT_ROOT}/lib/x86_64-linux-gnu")
-    set(AJI_NVINFER nvinfer)
+    message(STATUS "No CUDA toolchain found; skipping the TensorRT backend (aji_trt) "
+                   "and CUDA tools. The ROCm/MIGraphX backend (aji_rocm) still builds.")
 endif()
-
-find_package(CUDAToolkit REQUIRED)
 
 # aji: thin dispatcher (what the mpv filter loads as lib=). Parses the
 # conf's [global] backend key and forwards the C ABI to the sibling
@@ -44,6 +61,7 @@ set_target_properties(aji PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CXX_VISIBILITY_PRESET hidden)
 
+if(AJI_HAVE_CUDA)
 # aji_trt: TensorRT/CUDA backend (the former aji.dll).
 add_library(aji_trt SHARED src/aji_trt.cpp src/aji_conf.cpp src/kernels.cu)
 target_include_directories(aji_trt
@@ -109,6 +127,7 @@ else()
         message(STATUS "ffmpeg/libav not found via pkg-config; skipping aji_encode target")
     endif()
 endif()
+endif()  # AJI_HAVE_CUDA
 
 # aji_dml: DirectML backend (Windows only). Needs the ONNX Runtime
 # DirectML headers (Microsoft.ML.OnnxRuntime.DirectML nupkg) and the
@@ -133,8 +152,180 @@ if(WIN32)
     add_dependencies(aji_harness_dml aji_dml)
 endif()
 
+if(AJI_HAVE_CUDA)
 # Parity test tool: compiles the kernels directly (the shared lib hides
 # the launcher symbols), no TensorRT dependency.
 add_executable(aji_kernel_test src/kernel_test.c src/kernels.cu)
 target_include_directories(aji_kernel_test PRIVATE include src)
 target_link_libraries(aji_kernel_test PRIVATE CUDA::cudart)
+endif()
+
+# RIFE self-test harness: standalone CPU unit tests (no GPU required).
+add_executable(rife_selftest src/rife_selftest.cpp src/rife_cpu.cpp)
+target_include_directories(rife_selftest PRIVATE src include)
+# rife_cpu.cpp pulls resample.h which uses f16c/AVX intrinsics; match aji_rocm's CXX flags.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    target_compile_options(rife_selftest PRIVATE -mf16c -mavx2 -mfma)
+endif()
+
+# aji_host_harness: CUDA-free CLI over the host-plane path (dlopens the dispatcher, backend
+# from the conf). The engine-only smoke/perf tool for Vulkan/ROCm boxes and macOS.
+add_executable(aji_host_harness test/aji_host_harness.c)
+target_include_directories(aji_host_harness PRIVATE include)
+target_link_libraries(aji_host_harness PRIVATE ${CMAKE_DL_LIBS})
+
+find_package(OpenMP)
+
+# aji_vk: ncnn-Vulkan backend — the PORTABLE Linux/AMD path (no ROCm install required).
+# Revived: gemm-CM (cooperative-matrix) convolutions + GPU-resident bit-exact color reach
+# ~50-72% of MIGraphX at 1080p, and RIFE on ncnn-Vulkan runs ~2.4x faster than ROCm on the
+# warp-heavy RIFE+upscale pipeline. Loaded by the dispatcher as libaji_vk.so for [global]
+# backend=Vulkan (or NCNN). Needs ncnn built with Vulkan at AJI_NCNN_ROOT (and the
+# gridsample_vulkan layer for GPU RIFE warps) + the Vulkan loader. Ships its cs_*.spv color
+# kernels in an spv/ dir next to the .so (found at runtime via dladdr; override AJI_VK_SPV_DIR).
+set(AJI_NCNN_ROOT "" CACHE PATH "ncnn source+build tree (has src/*.h and build*/src/libncnn.so|.dylib)")
+find_library(AJI_NCNN_LIB NAMES ncnn
+    PATHS "${AJI_NCNN_ROOT}/build/src" "${AJI_NCNN_ROOT}/build-fast/src" "${AJI_NCNN_ROOT}/lib")
+find_path(AJI_NCNN_INC NAMES net.h PATHS "${AJI_NCNN_ROOT}/src")
+find_path(AJI_NCNN_INC_GEN NAMES ncnn_export.h
+    PATHS "${AJI_NCNN_ROOT}/build/src" "${AJI_NCNN_ROOT}/build-fast/src")
+# Just the Vulkan loader; the vulkan/*.h headers come transitively via ncnn's gpu.h on
+# the default include path (find_package(Vulkan) needs an SDK layout we don't require).
+find_library(AJI_VULKAN_LIB NAMES vulkan)
+# ncnn's gpu.h includes <vulkan/vulkan.h> when built without NCNN_SIMPLEVK (the macOS
+# build links the MoltenVK-backed loader directly); make the headers findable if they
+# are not on the default path (e.g. Homebrew's /opt/homebrew/include).
+find_path(AJI_VULKAN_INC NAMES vulkan/vulkan.h)
+if(AJI_NCNN_LIB AND AJI_NCNN_INC AND AJI_NCNN_INC_GEN AND AJI_VULKAN_LIB)
+    add_library(aji_vk SHARED src/aji_vk.cpp src/aji_conf.cpp src/rife_cpu.cpp)
+    target_include_directories(aji_vk
+        PUBLIC include
+        PRIVATE src "${AJI_NCNN_INC}" "${AJI_NCNN_INC_GEN}")
+    if(AJI_VULKAN_INC)
+        target_include_directories(aji_vk PRIVATE "${AJI_VULKAN_INC}")
+    endif()
+    # -mf16c/-mavx2 so rife_cpu's per-frame fp32<->fp16 RGB casts vectorize (vcvtps2ph/ph2ps).
+    # x86-64 only; arm64 (Apple silicon) has native fp16 converts.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        target_compile_options(aji_vk PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mf16c -mavx2 -mfma>)
+    endif()
+    target_link_libraries(aji_vk PRIVATE "${AJI_NCNN_LIB}" "${AJI_VULKAN_LIB}" ${CMAKE_DL_LIBS})
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(aji_vk PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    # libncnn + the Vulkan loader ship next to the backend; on macOS the loader is
+    # MoltenVK's (there is no system Vulkan), so the bundle carries it too.
+    set(AJI_ORIGIN_RPATH "$ORIGIN")
+    if(APPLE)
+        set(AJI_ORIGIN_RPATH "@loader_path")
+    endif()
+    set_target_properties(aji_vk PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden
+        BUILD_RPATH "${AJI_ORIGIN_RPATH}"
+        INSTALL_RPATH "${AJI_ORIGIN_RPATH}")
+    if(NOT WIN32 AND NOT APPLE)
+        target_link_options(aji_vk PRIVATE -Wl,-Bsymbolic)   # ELF-only flag
+    endif()
+    # ship the color kernels next to the built lib (runtime dladdr looks for ./spv)
+    add_custom_command(TARGET aji_vk POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_CURRENT_SOURCE_DIR}/spv" "$<TARGET_FILE_DIR:aji_vk>/spv")
+    message(STATUS "aji_vk (ncnn-Vulkan) backend: ENABLED (ncnn=${AJI_NCNN_LIB})")
+else()
+    message(STATUS "aji_vk (ncnn-Vulkan): ncnn/Vulkan not found "
+                   "(set -DAJI_NCNN_ROOT to your ncnn tree); skipping")
+endif()
+
+# aji_rocm: AMD ROCm/MIGraphX backend (the Linux/AMD real-time path; TensorRT-class on
+# conv-only upscaling, where it leads aji_vk). Loaded by the dispatcher as
+# libaji_rocm.so. Runs the SAME fp16 .onnx as aji_trt/aji_dml on MIGraphX; CPU color via
+# resample.h (OpenMP). Needs MIGraphX (libmigraphx_c) + ROCm at AJI_ROCM_ROOT.
+set(AJI_ROCM_ROOT "/opt/rocm" CACHE PATH "ROCm install root (migraphx headers + libs)")
+find_library(AJI_MIGRAPHX_LIB NAMES migraphx_c PATHS "${AJI_ROCM_ROOT}/lib")
+find_library(AJI_HIP_LIB NAMES amdhip64 PATHS "${AJI_ROCM_ROOT}/lib")
+if(AJI_MIGRAPHX_LIB AND AJI_HIP_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraphx/migraphx.hpp")
+    # GPU-resident color (Phase B): aji_rocm_color_device.hip holds the YUV<->RGB +
+    # chroma resample kernels; they are JIT-compiled per-GPU with hipRTC at runtime
+    # (src/aji_rocm_color.cpp), so libaji_rocm.so embeds NO device code and runs on any
+    # AMD arch. Embed the device source as a string for the JIT loader.
+    find_library(AJI_HIPRTC_LIB NAMES hiprtc PATHS "${AJI_ROCM_ROOT}/lib")
+    set(AJI_COLOR_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/aji_rocm_color_device.hip)
+    set(AJI_COLOR_GEN ${CMAKE_CURRENT_BINARY_DIR}/gen/aji_rocm_color_device_src.h)
+    add_custom_command(
+        OUTPUT ${AJI_COLOR_GEN}
+        COMMAND ${CMAKE_COMMAND} -DIN=${AJI_COLOR_SRC} -DOUT=${AJI_COLOR_GEN}
+                -DVAR=AJI_ROCM_COLOR_SRC -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake
+        DEPENDS ${AJI_COLOR_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake
+        COMMENT "Embedding aji_rocm_color device source")
+    # rife_cpu.cpp (RIFE CPU color/scene/geometry) joins the library; the device color
+    # is JIT (hipRTC), so there is no enable_language(HIP) / gfx arch list.
+    add_library(aji_rocm SHARED src/aji_rocm.cpp src/aji_rocm_color.cpp src/aji_conf.cpp src/rife_cpu.cpp ${AJI_COLOR_GEN})
+    target_include_directories(aji_rocm
+        PUBLIC include
+        PRIVATE src ${CMAKE_CURRENT_BINARY_DIR}/gen "${AJI_ROCM_ROOT}/include")
+    target_compile_options(aji_rocm PRIVATE -mf16c -mavx2 -mfma)
+    target_compile_definitions(aji_rocm PRIVATE __HIP_PLATFORM_AMD__)
+    target_link_libraries(aji_rocm PRIVATE ${AJI_MIGRAPHX_LIB} ${AJI_HIP_LIB} ${AJI_HIPRTC_LIB})
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(aji_rocm PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    set_target_properties(aji_rocm PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden
+        BUILD_RPATH "${AJI_ROCM_ROOT}/lib"
+        INSTALL_RPATH "$ORIGIN:${AJI_ROCM_ROOT}/lib")
+    if(NOT WIN32)
+        target_link_options(aji_rocm PRIVATE -Wl,-Bsymbolic)
+    endif()
+
+    # aji_rocm_compile: the OUT-OF-PROCESS MIGraphX engine compiler. The async_build
+    # path fork/execs this instead of compiling MIGraphX in-process, so a player quit
+    # mid-compile just SIGKILLs the child (no in-process compile threads racing exit
+    # teardown). Ships next to libaji_rocm.so (aji_rocm finds it via dladdr). Shares
+    # aji_rocm_mxr.h with the lib so the compiled .mxr is byte-identical.
+    add_executable(aji_rocm_compile src/aji_rocm_compile.cpp)
+    target_include_directories(aji_rocm_compile PRIVATE include src "${AJI_ROCM_ROOT}/include")
+    target_link_libraries(aji_rocm_compile PRIVATE ${AJI_MIGRAPHX_LIB} ${AJI_HIP_LIB})
+    set_target_properties(aji_rocm_compile PROPERTIES
+        BUILD_RPATH "${AJI_ROCM_ROOT}/lib"
+        INSTALL_RPATH "$ORIGIN:${AJI_ROCM_ROOT}/lib")
+    add_dependencies(aji_rocm aji_rocm_compile)   # build the helper alongside the lib
+
+    # Characterization test for the GPU out-color kernels (golden regression).
+    add_executable(aji_rocm_color_test test/rocm_color_test.cpp src/aji_rocm_color.cpp ${AJI_COLOR_GEN})
+    target_include_directories(aji_rocm_color_test PRIVATE include src ${CMAKE_CURRENT_BINARY_DIR}/gen "${AJI_ROCM_ROOT}/include")
+    target_compile_options(aji_rocm_color_test PRIVATE -mf16c -mavx2 -mfma)
+    target_compile_definitions(aji_rocm_color_test PRIVATE __HIP_PLATFORM_AMD__)
+    target_link_libraries(aji_rocm_color_test PRIVATE ${AJI_HIP_LIB} ${AJI_HIPRTC_LIB})
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(aji_rocm_color_test PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+
+    # RIFE end-to-end gate (tasks A8/A9): links libaji_rocm.so, drives the engine
+    # through a RIFE-only conf chain, waits for the first-run compile, and asserts
+    # the engine loads, aji_rife_factor reports the configured factor, aji_infer_rife
+    # interpolates a valid frame, and a hard cut returns AJI_SCENE. Host frames only
+    # (aji_rocm planes are host pointers) so it needs no resample.h / f16c flags.
+    add_executable(rife_harness test/rife_harness.cpp)
+    target_include_directories(rife_harness PRIVATE include src)
+    target_link_libraries(rife_harness PRIVATE aji_rocm)
+
+    # Clean engine-level RIFE+upscale pipeline benchmark: one chain that BOTH
+    # upscales (2x SD Compact) AND interpolates (rife_v4.26, before_upscale), driven
+    # exactly like the player's filter (aji_infer_rife + aji_infer/aji_wait), to
+    # characterize "RIFE 2x at 480p" output fps without mpv noise.
+    add_executable(rife_pipeline_bench test/rife_pipeline_bench.cpp)
+    target_include_directories(rife_pipeline_bench PRIVATE include src)
+    target_link_libraries(rife_pipeline_bench PRIVATE aji_rocm)
+
+    # rocm_rife_transcode: minimal OFFLINE RIFE+upscale transcode FILTER. Reuses
+    # rife_pipeline_bench's conf/create/configure + RIFE-first flow, but reads raw
+    # NV12 from stdin and writes upscaled NV12 to stdout (ffmpeg does decode+encode
+    # around it) — the ROCm replacement for the CUDA-only aji_encode CLI.
+    add_executable(rocm_rife_transcode test/rocm_rife_transcode.cpp)
+    target_include_directories(rocm_rife_transcode PRIVATE include src)
+    target_link_libraries(rocm_rife_transcode PRIVATE aji_rocm)
+else()
+    message(STATUS "MIGraphX (${AJI_ROCM_ROOT} libmigraphx_c) not found; skipping aji_rocm.")
+endif()

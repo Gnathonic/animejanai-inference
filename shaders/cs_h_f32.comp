@@ -1,0 +1,18 @@
+#version 450
+layout(local_size_x = 32, local_size_y = 8) in;
+// horizontal downsample of one planar fp32 plane: src(srcw x h) -> dst(dstw x h)
+layout(binding = 0) readonly  buffer Src   { float src[]; };
+layout(binding = 1) readonly  buffer Start { float startf[]; };
+layout(binding = 2) readonly  buffer Wt    { float wt[]; };
+layout(binding = 3) writeonly buffer Dst   { float dst[]; };
+layout(push_constant) uniform parameter { int dstw; int h; int taps; int srcw; } p;
+int mirr(int i, int n){ i = i<0 ? -i-1 : i; i = i>=n ? 2*n-1-i : i; return clamp(i,0,n-1); }
+void main(){
+    int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+    if (x >= p.dstw || y >= p.h) return;
+    int s0 = int(startf[x]);
+    float a = 0.0;
+    for (int j = 0; j < p.taps; j++)
+        a += wt[x*p.taps + j] * src[y*p.srcw + mirr(s0+j, p.srcw)];
+    dst[y*p.dstw + x] = a;
+}

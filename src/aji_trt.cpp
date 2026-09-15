@@ -524,7 +524,8 @@ bool parse_shape_wh(const std::string &settings, const char *key, int *w, int *h
 struct BuildSpec {
     std::string cmdline;      // "trtexec" --onnx=... --saveEngine=...
     std::string env_prefix;   // POSIX only, e.g. "LD_LIBRARY_PATH=..."
-    std::string engine_path;
+    std::string engine_path;  // final cache path (published only on success)
+    std::string build_path;   // temp --saveEngine target, renamed on success
     std::string log_path;     // trtexec output, kept for diagnostics
     std::string name;
     std::string res;          // shapes_label() of the build settings
@@ -593,13 +594,23 @@ int run_build_process(const BuildSpec &spec, std::atomic<intptr_t> *child)
 bool run_build_spec(const BuildSpec &spec, std::atomic<intptr_t> *child)
 {
     int rc = run_build_process(spec, child);
-    if (rc != 0 || !file_exists(spec.engine_path)) {
-        remove_file(spec.engine_path);
+    // upstream's path helpers (wide-char-safe on Windows) + our atomic
+    // build_path -> engine_path rename publish
+    std::error_code ec;
+    if (rc != 0 || !file_exists(spec.build_path)) {
+        remove_file(spec.build_path);
         char msg[96];
         snprintf(msg, sizeof(msg),
                  "\n[aji] build process exit code: %d (0x%x)\n", rc,
                  (unsigned)rc);
         append_file_text(spec.log_path, msg);
+        return false;
+    }
+    // Atomic publish: a same-directory rename is atomic, so the final cache
+    // path never exists as a partial/0-byte engine.
+    fs::rename(spec.build_path, spec.engine_path, ec);
+    if (ec) {
+        fs::remove(spec.build_path, ec);
         return false;
     }
     return true;
@@ -681,8 +692,17 @@ bool make_build_spec(aji_ctx *c, const std::string &onnx_name,
 #else
     const std::string &cmd_settings = settings;
 #endif
+    // Build to a temp path and atomically rename on success (see
+    // run_build_spec). trtexec creates --saveEngine immediately and fills it
+    // at the end; if the process is killed mid-build (e.g. a benchmark that
+    // kills cells, or mpv quitting) a 0-byte file would otherwise be left at
+    // the final cache path. ensure_engine() does self-heal such a file on the
+    // next play, but a 0-byte cache entry that *looks* valid is what makes the
+    // filter silently pass frames through in the meantime. Renaming means the
+    // final path only ever exists as a complete engine.
+    spec->build_path = engine_path + ".building";
     spec->cmdline = "\"" + c->trtexec + "\" --onnx=\"" + onnx_path +
-                    "\" --saveEngine=\"" + engine_path + "\" " +
+                    "\" --saveEngine=\"" + spec->build_path + "\" " +
                     cmd_settings +
                     " --timingCacheFile=\"" + tcache + "\"";
     spec->env_prefix = c->trtexec_env;
@@ -1999,6 +2019,13 @@ extern "C" AJI_EXPORT const char *aji_current_log(aji_ctx *c)
 extern "C" AJI_EXPORT int aji_scale_factor(aji_ctx *c)
 {
     return c ? c->scale : 0;
+}
+
+// Completion-event ring size: the filter clamps its pipeline depth to this so it
+// never has more tickets outstanding than the ring tracks.
+extern "C" AJI_EXPORT int aji_max_in_flight(aji_ctx * /*c*/)
+{
+    return aji_ctx::TICK_RING;
 }
 
 extern "C" AJI_EXPORT int aji_poll(aji_ctx *c)

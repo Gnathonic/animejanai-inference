@@ -209,6 +209,14 @@ Not needed to build libaji — only for `build-installer.cmd` and the install/up
 
 ## The release build
 
+> **CUDA is probed, not required, since the Linux/AMD backends landed.** If the CUDA
+> toolchain is not found, configure no longer fails — it prints
+> `-- No CUDA toolchain found; skipping the TensorRT backend (aji_trt) and CUDA tools.`
+> and builds only the dispatcher (and any other backend whose deps are present). On the
+> Windows release flow that means a broken `CUDA_PATH` shows up at packaging time
+> (`package-aji-release.ps1` throws on the missing `aji_trt.dll`) instead of at configure;
+> check the configure log for that line.
+
 One script, `%AJI_WIN%\build-aji-release.bat`. Its own header calls it "the single
 canonical release build of the aji engine". Just run it:
 
