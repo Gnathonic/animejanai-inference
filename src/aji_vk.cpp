@@ -263,28 +263,43 @@ static std::string bin_for(const std::string& param) {
     return param + ".bin";
 }
 
-// Load a classic-ncnn model and probe its spatial scale with a small dummy run.
-static std::unique_ptr<NcnnModel> load_model(aji_ctx* c, const std::string& param) {
-    auto m = std::make_unique<NcnnModel>();
-    m->net.opt.use_vulkan_compute = true;
-    m->net.opt.use_fp16_packed = true;
-    m->net.opt.use_fp16_storage = true;   // model output VkMat is fp16; the GPU post reads it as fp16
-    m->net.opt.use_fp16_arithmetic = true;
+// ncnn Vulkan options shared by the upscale and RIFE nets. Defaults are the measured-best
+// set on RADV/RDNA (see comments); every one has an AJI_VK_* env override for A/B on
+// other GPUs (MoltenVK/Apple, NVIDIA, Intel) — an unset var keeps the default.
+static bool env_flag(const char* name, bool dflt) {
+    const char* v = getenv(name);
+    return v ? atoi(v) != 0 : dflt;
+}
+static void apply_vk_model_opts(ncnn::Option& o) {
+    o.use_vulkan_compute = true;
+    o.use_fp16_packed = env_flag("AJI_VK_FP16_PACKED", true);
+    o.use_fp16_storage = env_flag("AJI_VK_FP16_STORAGE", true);   // model output VkMat is fp16; the GPU post reads it as fp16
+    o.use_fp16_arithmetic = env_flag("AJI_VK_FP16_ARITH", true);
     // ncnn has no TensorRT-style per-layer engine build; the matrix-core
     // (cooperative_matrix) GEMM path is the big win. Gated by device support inside
     // ncnn, so safe to request unconditionally; AJI_VK_NO_CM=1 disables it for A/B.
-    m->net.opt.use_cooperative_matrix = getenv("AJI_VK_NO_CM") == nullptr;
-    // Winograd OFF on purpose: on RADV/gfx1201 ncnn's winograd23/43 path is memory-
-    // bandwidth-bound (6x6 tiles, 2.25x intermediate storage) and ~2x SLOWER at HD/4K
-    // than the implicit-GEMM cooperative-matrix path (im2col-free WMMA GEMM). Measured
-    // 1080p->4K pure model: winograd 15.3 fps vs gemm-CM 28.9 (Balanced), 32 vs 63
-    // (Performance); gemm-CM wins at every lower res too and is more numerically
+    o.use_cooperative_matrix = getenv("AJI_VK_NO_CM") == nullptr;
+    // Winograd OFF by default on purpose: on RADV/gfx1201 ncnn's winograd23/43 path is
+    // memory-bandwidth-bound (6x6 tiles, 2.25x intermediate storage) and ~2x SLOWER at
+    // HD/4K than the implicit-GEMM cooperative-matrix path (im2col-free WMMA GEMM).
+    // Measured 1080p->4K pure model: winograd 15.3 fps vs gemm-CM 28.9 (Balanced), 32 vs
+    // 63 (Performance); gemm-CM wins at every lower res too and is more numerically
     // accurate (no winograd transform; matches winograd within 0.3% fp16).
-    // AJI_VK_WINOGRAD=1 restores winograd for A/B.
-    m->net.opt.use_winograd_convolution = getenv("AJI_VK_WINOGRAD") != nullptr;
-    m->net.opt.use_sgemm_convolution = true;
-    m->net.opt.use_subgroup_ops = true;
-    m->net.opt.use_shader_local_memory = true;
+    // Without cooperative matrix (MoltenVK/Apple, older GPUs) winograd is the faster
+    // conv path — measured 2.1x on an M2 Pro — so it defaults ON there.
+    // AJI_VK_WINOGRAD=1/0 forces it either way.
+    const bool has_cm = ncnn::get_gpu_count() > 0 &&
+                        ncnn::get_gpu_info(ncnn::get_default_gpu_index()).support_cooperative_matrix();
+    o.use_winograd_convolution = env_flag("AJI_VK_WINOGRAD", !has_cm);
+    o.use_sgemm_convolution = env_flag("AJI_VK_SGEMM", true);
+    o.use_subgroup_ops = env_flag("AJI_VK_SUBGROUP", true);
+    o.use_shader_local_memory = env_flag("AJI_VK_LOCALMEM", true);
+}
+
+// Load a classic-ncnn model and probe its spatial scale with a small dummy run.
+static std::unique_ptr<NcnnModel> load_model(aji_ctx* c, const std::string& param) {
+    auto m = std::make_unique<NcnnModel>();
+    apply_vk_model_opts(m->net.opt);
     if (m->net.load_param(param.c_str())) { c->err = "load_param failed: " + param; return nullptr; }
     std::string bin = bin_for(param);
     if (m->net.load_model(bin.c_str())) { c->err = "load_model failed: " + bin; return nullptr; }
@@ -308,15 +323,7 @@ static std::unique_ptr<NcnnModel> load_model(aji_ctx* c, const std::string& para
 // Vulkan/fp16/coopmat opts as load_model but no 3-channel scale probe (the input is 11ch).
 static std::unique_ptr<NcnnModel> load_rife_model(aji_ctx* c, const std::string& param) {
     auto m = std::make_unique<NcnnModel>();
-    m->net.opt.use_vulkan_compute = true;
-    m->net.opt.use_fp16_packed = true;
-    m->net.opt.use_fp16_storage = true;
-    m->net.opt.use_fp16_arithmetic = true;
-    m->net.opt.use_cooperative_matrix = getenv("AJI_VK_NO_CM") == nullptr;
-    m->net.opt.use_winograd_convolution = getenv("AJI_VK_WINOGRAD") != nullptr;
-    m->net.opt.use_sgemm_convolution = true;
-    m->net.opt.use_subgroup_ops = true;
-    m->net.opt.use_shader_local_memory = true;
+    apply_vk_model_opts(m->net.opt);
     if (m->net.load_param(param.c_str())) { c->err = "rife load_param failed: " + param; return nullptr; }
     std::string bin = bin_for(param);
     if (m->net.load_model(bin.c_str())) { c->err = "rife load_model failed: " + bin; return nullptr; }
