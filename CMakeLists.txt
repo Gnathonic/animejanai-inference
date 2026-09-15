@@ -192,11 +192,18 @@ find_path(AJI_NCNN_INC_GEN NAMES ncnn_export.h
 # Just the Vulkan loader; the vulkan/*.h headers come transitively via ncnn's gpu.h on
 # the default include path (find_package(Vulkan) needs an SDK layout we don't require).
 find_library(AJI_VULKAN_LIB NAMES vulkan)
+# ncnn's gpu.h includes <vulkan/vulkan.h> when built without NCNN_SIMPLEVK (the macOS
+# build links the MoltenVK-backed loader directly); make the headers findable if they
+# are not on the default path (e.g. Homebrew's /opt/homebrew/include).
+find_path(AJI_VULKAN_INC NAMES vulkan/vulkan.h)
 if(AJI_NCNN_LIB AND AJI_NCNN_INC AND AJI_NCNN_INC_GEN AND AJI_VULKAN_LIB)
     add_library(aji_vk SHARED src/aji_vk.cpp src/aji_conf.cpp src/rife_cpu.cpp)
     target_include_directories(aji_vk
         PUBLIC include
         PRIVATE src "${AJI_NCNN_INC}" "${AJI_NCNN_INC_GEN}")
+    if(AJI_VULKAN_INC)
+        target_include_directories(aji_vk PRIVATE "${AJI_VULKAN_INC}")
+    endif()
     # -mf16c/-mavx2 so rife_cpu's per-frame fp32<->fp16 RGB casts vectorize (vcvtps2ph/ph2ps).
     # x86-64 only; arm64 (Apple silicon) has native fp16 converts.
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")

@@ -1135,6 +1135,17 @@ AJI_EXPORT aji_ctx* aji_create(const aji_create_params* p) {
     if (const char* pe = getenv("AJI_VK_PACKED_DL")) c->packed_dl = atoi(pe) != 0;
     c->rife_model_dir = p->rife_model_dir ? p->rife_model_dir : "";   // dir with rife_v*.param/.bin (NULL disables RIFE)
 
+    // Fail loudly when there is no usable Vulkan device. ncnn would otherwise run the
+    // whole chain on the CPU (seconds per frame) and only whisper "load vulkan driver
+    // failed" to stderr — seen on macOS when the loader dylib was not on the search path.
+    ncnn::create_gpu_instance();
+    if (ncnn::get_gpu_count() <= 0) {
+        c->err = "aji_vk: no Vulkan device (loader/driver not found; on macOS the "
+                 "MoltenVK loader must sit next to libaji_vk or on DYLD_LIBRARY_PATH)";
+        logmsg(c, 2, c->err.c_str());
+        return c;
+    }
+
     if (p->conf_path && p->conf_path[0]) {
         c->conf_mode = true;
         c->model_dir = p->model_dir ? p->model_dir : ".";
