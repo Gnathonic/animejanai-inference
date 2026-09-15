@@ -5,6 +5,8 @@ fixtures/*.png
 fixtures/*.mkv
 sanity/saxpy
 *.engine
+build-win-release/
+build-win-trt11*/
 
 # Linux Vulkan backend build artifacts
 /build/
