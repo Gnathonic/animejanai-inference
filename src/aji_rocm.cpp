@@ -371,7 +371,19 @@ static std::unique_ptr<MgxModel> load_model(aji_ctx* c, const std::string& onnx_
             std::string e;
             if (!aji_rocm_compile_mxr(onnx_path, in_w, in_h, &e, in_channels)) { c->err = e; return nullptr; }
         }
-        m->prog = migraphx::load(cache.c_str());
+        try {
+            m->prog = migraphx::load(cache.c_str());
+        } catch (const std::exception& e) {
+            // Self-heal a stale/foreign/corrupt cache (other GPU arch before the arch was in
+            // the key, MIGraphX version bump, truncated file): drop it, compile once, retry.
+            char w[512];
+            snprintf(w, sizeof w, "cached engine %s failed to load (%s); rebuilding", cache.c_str(), e.what());
+            logmsg(c, 2, w);
+            std::remove(cache.c_str());
+            std::string e2;
+            if (!aji_rocm_compile_mxr(onnx_path, in_w, in_h, &e2, in_channels)) { c->err = e2; return nullptr; }
+            m->prog = migraphx::load(cache.c_str());
+        }
     } catch (const std::exception& e) {
         c->err = "migraphx engine load failed (" + cache + "): " + e.what();
         return nullptr;
@@ -1015,13 +1027,14 @@ static int run_chain_gpu(aji_ctx* c, RgbMat& rgb_in, const aji_frame* out,
             std::lock_guard<std::mutex> lk(c->gpu_eval_mtx);
             // eval→gpu-out-color→final sync all on the default stream: one lock covers both.
             auto outs = nm->prog.eval(pp);   // inference graph (MIGraphX), not code-eval
-            // No device-wide sync here: the out-color kernels below enqueue on the
-            // same (default) stream after the eval, and the final sync at the end
-            // of this block covers completion before the D2H. get_shape() below is
-            // compiled-static metadata, not a device read. AJI_ROCM_TIMING keeps
-            // the sync so its eval number stays exec-time, not enqueue-time.
+            // Device-wide sync REQUIRED here: MIGraphX evaluates on its own HIP stream,
+            // not the null stream the out-color kernels below are enqueued on, so without
+            // it the color kernels read the PREVIOUS frame's model output (a one-frame
+            // lag: first frame black, every frame after that the one before it — caught
+            // by feeding distinct gray frames through aji_host_harness). Dropping this
+            // sync as a perf lever (2026-07) was wrong; it costs ~0.1 ms.
+            if (hipDeviceSynchronize() != hipSuccess) { if (errmsg) *errmsg = "eval sync failed"; return AJI_ERR; }
             if (getenv("AJI_ROCM_TIMING")) {
-                if (hipDeviceSynchronize() != hipSuccess) { if (errmsg) *errmsg = "eval sync failed"; return AJI_ERR; }
                 static double te=0; static long ne=0;
                 te += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-_ge).count();
                 if (++ne % 50 == 0) fprintf(stderr, "[AJI_ROCM_TIMING/eval] eval+sync=%.1fms\n", te/ne); }

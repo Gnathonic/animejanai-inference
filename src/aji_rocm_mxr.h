@@ -13,6 +13,10 @@
 // compile threads: quit just SIGKILLs the child and the player exits cleanly.
 #pragma once
 #include <migraphx/migraphx.hpp>
+#ifndef __HIP_PLATFORM_AMD__
+#define __HIP_PLATFORM_AMD__ 1
+#endif
+#include <hip/hip_runtime.h>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -31,9 +35,22 @@ inline bool mxr_exhaustive_tune() {
 }
 
 // The .mxr cache key: <onnx>.<w>x<h>.c<channels>.dev.mlir.fp16[.exh].mxr
+// The GPU the engine is compiled for ("gfx1030", "gfx1201", ...). A saved .mxr embeds
+// device code for exactly one arch, so it is part of the cache key: an engine compiled on
+// one AMD GPU fails to load ("Failed to call function") on another, which bites when a
+// model dir moves between machines or the GPU is upgraded.
+inline const std::string& mxr_gpu_arch() {
+    static const std::string arch = [] {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, 0) != hipSuccess) return std::string("gfxunknown");
+        std::string a = prop.gcnArchName;            // "gfx1030:sramecc+:xnack-"
+        return a.substr(0, a.find(':'));
+    }();
+    return arch;
+}
 inline std::string mxr_cache_path(const std::string& onnx, int w, int h, int channels = 3) {
     return onnx + "." + std::to_string(w) + "x" + std::to_string(h)
-           + ".c" + std::to_string(channels) + ".dev.mlir.fp16"
+           + ".c" + std::to_string(channels) + "." + mxr_gpu_arch() + ".dev.mlir.fp16"
            + (mxr_exhaustive_tune() ? ".exh" : "") + ".mxr";
 }
 inline bool mxr_cached(const std::string& onnx, int w, int h, int channels = 3) {
