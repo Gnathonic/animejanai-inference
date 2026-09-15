@@ -164,7 +164,15 @@ endif()
 add_executable(rife_selftest src/rife_selftest.cpp src/rife_cpu.cpp)
 target_include_directories(rife_selftest PRIVATE src include)
 # rife_cpu.cpp pulls resample.h which uses f16c/AVX intrinsics; match aji_rocm's CXX flags.
-target_compile_options(rife_selftest PRIVATE -mf16c -mavx2 -mfma)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    target_compile_options(rife_selftest PRIVATE -mf16c -mavx2 -mfma)
+endif()
+
+# aji_host_harness: CUDA-free CLI over the host-plane path (dlopens the dispatcher, backend
+# from the conf). The engine-only smoke/perf tool for Vulkan/ROCm boxes and macOS.
+add_executable(aji_host_harness test/aji_host_harness.c)
+target_include_directories(aji_host_harness PRIVATE include)
+target_link_libraries(aji_host_harness PRIVATE ${CMAKE_DL_LIBS})
 
 find_package(OpenMP)
 
