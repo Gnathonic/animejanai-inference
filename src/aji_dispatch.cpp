@@ -129,8 +129,10 @@ static void lib_close(aji_lib lib)
 static bool load_backend(const char *stem, aji_backend *be,
                          std::string *err)
 {
-#ifdef _WIN32
+#if defined(_WIN32)
     std::string path = own_dir() + "\\" + stem + ".dll";
+#elif defined(__APPLE__)
+    std::string path = own_dir() + "/lib" + stem + ".dylib";
 #else
     std::string path = own_dir() + "/lib" + stem + ".so";
 #endif

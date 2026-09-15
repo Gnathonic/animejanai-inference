@@ -175,7 +175,7 @@ find_package(OpenMP)
 # backend=Vulkan (or NCNN). Needs ncnn built with Vulkan at AJI_NCNN_ROOT (and the
 # gridsample_vulkan layer for GPU RIFE warps) + the Vulkan loader. Ships its cs_*.spv color
 # kernels in an spv/ dir next to the .so (found at runtime via dladdr; override AJI_VK_SPV_DIR).
-set(AJI_NCNN_ROOT "" CACHE PATH "ncnn source+build tree (has src/*.h and build*/src/libncnn.so)")
+set(AJI_NCNN_ROOT "" CACHE PATH "ncnn source+build tree (has src/*.h and build*/src/libncnn.so|.dylib)")
 find_library(AJI_NCNN_LIB NAMES ncnn
     PATHS "${AJI_NCNN_ROOT}/build/src" "${AJI_NCNN_ROOT}/build-fast/src" "${AJI_NCNN_ROOT}/lib")
 find_path(AJI_NCNN_INC NAMES net.h PATHS "${AJI_NCNN_ROOT}/src")
@@ -190,18 +190,27 @@ if(AJI_NCNN_LIB AND AJI_NCNN_INC AND AJI_NCNN_INC_GEN AND AJI_VULKAN_LIB)
         PUBLIC include
         PRIVATE src "${AJI_NCNN_INC}" "${AJI_NCNN_INC_GEN}")
     # -mf16c/-mavx2 so rife_cpu's per-frame fp32<->fp16 RGB casts vectorize (vcvtps2ph/ph2ps).
-    target_compile_options(aji_vk PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mf16c -mavx2 -mfma>)
+    # x86-64 only; arm64 (Apple silicon) has native fp16 converts.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        target_compile_options(aji_vk PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mf16c -mavx2 -mfma>)
+    endif()
     target_link_libraries(aji_vk PRIVATE "${AJI_NCNN_LIB}" "${AJI_VULKAN_LIB}" ${CMAKE_DL_LIBS})
     if(OpenMP_CXX_FOUND)
         target_link_libraries(aji_vk PRIVATE OpenMP::OpenMP_CXX)
     endif()
+    # libncnn + the Vulkan loader ship next to the backend; on macOS the loader is
+    # MoltenVK's (there is no system Vulkan), so the bundle carries it too.
+    set(AJI_ORIGIN_RPATH "$ORIGIN")
+    if(APPLE)
+        set(AJI_ORIGIN_RPATH "@loader_path")
+    endif()
     set_target_properties(aji_vk PROPERTIES
         POSITION_INDEPENDENT_CODE ON
         CXX_VISIBILITY_PRESET hidden
-        BUILD_RPATH "$ORIGIN"
-        INSTALL_RPATH "$ORIGIN")
-    if(NOT WIN32)
-        target_link_options(aji_vk PRIVATE -Wl,-Bsymbolic)
+        BUILD_RPATH "${AJI_ORIGIN_RPATH}"
+        INSTALL_RPATH "${AJI_ORIGIN_RPATH}")
+    if(NOT WIN32 AND NOT APPLE)
+        target_link_options(aji_vk PRIVATE -Wl,-Bsymbolic)   # ELF-only flag
     endif()
     # ship the color kernels next to the built lib (runtime dladdr looks for ./spv)
     add_custom_command(TARGET aji_vk POST_BUILD
