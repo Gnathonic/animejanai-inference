@@ -61,14 +61,22 @@ static const char *CONF_TEXT =
     "chain_7_rife_scene_detect_threshold=0.150\n"
     "chain_7_rife_before_upscale=yes\n";
 
-static const char *RIFE_DIR =
+static const char *RIFE_DIR_DEFAULT =
     "/home/nathan/AnimeJaNai-Linux/mpv-upscale-2x_animejanai-v0.4.3-linux/"
     "animejanai/rife";
 // model_dir: a RIFE-only chain has no upscale .onnx to find, so any existing dir
 // is fine; point it at the animejanai dir (the rife dir's parent).
-static const char *MODEL_DIR =
+static const char *MODEL_DIR_DEFAULT =
     "/home/nathan/AnimeJaNai-Linux/mpv-upscale-2x_animejanai-v0.4.3-linux/"
     "animejanai";
+// Override the fixture locations without editing the source (the defaults are one
+// workstation's install dir): AJI_RIFE_DIR=<dir with rife_v4.*.onnx>, AJI_MODEL_DIR.
+static const char *env_or(const char *name, const char *dflt) {
+    const char *v = getenv(name);
+    return (v && *v) ? v : dflt;
+}
+static const char *RIFE_DIR  = env_or("AJI_RIFE_DIR",  RIFE_DIR_DEFAULT);
+static const char *MODEL_DIR = env_or("AJI_MODEL_DIR", MODEL_DIR_DEFAULT);
 
 static const int  W = 640, H = 480;          // real case: 640x480 -> pads to 640x512 RIFE
 static const double FPS = 48.0;              // 2x -> source 24-ish; matches the chain

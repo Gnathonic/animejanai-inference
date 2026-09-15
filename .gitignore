@@ -17,3 +17,6 @@ aji_rocm_compile
 # hipRTC JIT cache (per-machine, per-GPU; created at runtime; never commit)
 *.co
 cache/
+
+# any build-*/ tree (build-sync, build-vk, ...)
+/build-*/

@@ -13,7 +13,11 @@ CUDACXX=/usr/local/cuda/bin/nvcc cmake -B build -S .
 cmake --build build -j
 ```
 
-Requirements: **CUDA toolkit 13.x** and **TensorRT 11.x**.
+Requirements for the TensorRT backend: **CUDA toolkit 13.x** and **TensorRT 11.x**. CUDA is
+probed, not required: without `nvcc` the configure prints
+`-- No CUDA toolchain found; skipping the TensorRT backend (aji_trt) and CUDA tools.` and
+builds the dispatcher plus whichever of the [other Linux backends](#other-linux-backends-aji_rocm-and-aji_vk)
+have their dependencies.
 
 `AJI_TRT_ROOT` defaults to `$HOME/sdk/tensorrt/usr` on Linux. For a system TensorRT from
 NVIDIA's apt repo, pass `-DAJI_TRT_ROOT=/usr` instead. The Linux layout under that root is
@@ -23,8 +27,8 @@ NVIDIA's apt repo, pass `-DAJI_TRT_ROOT=/usr` instead. The Linux layout under th
 `aji_trt` gets `BUILD_RPATH`/`INSTALL_RPATH` pointing at `${AJI_TRT_LIB}` and links with
 `-Wl,-Bsymbolic`, so the built `.so` finds TensorRT without `LD_LIBRARY_PATH` gymnastics.
 
-> **Pass `-DCMAKE_CUDA_ARCHITECTURES` explicitly for anything you intend to ship.** The
-> `if(NOT DEFINED ...)` default in `CMakeLists.txt` never fires — see the CUDA-architecture
+> **Pass `-DCMAKE_CUDA_ARCHITECTURES` explicitly for anything you intend to ship.** Do not
+> rely on the `if(NOT DEFINED ...)` default in `CMakeLists.txt` — see the CUDA-architecture
 > trap in [`../CLAUDE.md`](../CLAUDE.md). For local iteration on one machine,
 > `-DCMAKE_CUDA_ARCHITECTURES=native` (or your SM, e.g. `120`) compiles far faster than the
 > eight-architecture release list.
@@ -34,8 +38,8 @@ libswscale`; otherwise CMake prints
 `-- ffmpeg/libav not found via pkg-config; skipping aji_encode target` and moves on. Install
 your distro's ffmpeg dev packages if you need the offline encoder.
 
-There are no DirectML targets on Linux — `aji_dml` and `aji_harness_dml` are `WIN32` only, so
-TensorRT is the sole Linux backend.
+There are no DirectML targets on Linux — `aji_dml` and `aji_harness_dml` are `WIN32` only.
+TensorRT is the NVIDIA backend; AMD and vendor-neutral GPUs use `aji_rocm` / `aji_vk` below.
 
 ### Quick manual test, no player needed
 
@@ -62,6 +66,68 @@ Or through mpv directly:
 ```sh
 mpv --hwdec=nvdec --vf=animejanai=engine=models/<model>.engine:lib=build/libaji.so video.mkv
 ```
+
+## Other Linux backends: `aji_rocm` and `aji_vk`
+
+Both are **optional** and gated on their own dependencies in `CMakeLists.txt`: each
+`find_library`/`find_path` group either enables the target or prints a `-- ... skipping`
+status, so a box without ROCm or ncnn (the CI image included) still gets the TensorRT-only
+build. The dispatcher picks them from `animejanai.conf`: `[global] backend=rocm` loads
+`libaji_rocm.so`, `backend=vulkan` (or `ncnn`) loads `libaji_vk.so`; anything else is TensorRT.
+
+| Backend | Runs on | Build needs | Configure status line |
+|---|---|---|---|
+| `aji_rocm` | AMD (ROCm) | `/opt/rocm` with MIGraphX (`libmigraphx_c`), HIP (`libamdhip64`) and hipRTC | `MIGraphX (... libmigraphx_c) not found; skipping aji_rocm.` |
+| `aji_vk` | any Vulkan GPU | ncnn built from source with Vulkan, the Vulkan loader | `aji_vk (ncnn-Vulkan): ncnn/Vulkan not found (set -DAJI_NCNN_ROOT to your ncnn tree); skipping` |
+
+### `aji_rocm` (AMD ROCm / MIGraphX)
+
+```sh
+cmake -B build -S . -DAJI_ROCM_ROOT=/opt/rocm      # /opt/rocm is the default
+cmake --build build -j
+roc-obj-ls build/libaji_rocm.so                    # expected: "No kernel section found"
+```
+
+Only a C++ compiler and the ROCm headers/libraries are needed — no HIP compiler and no gfx
+arch list. The color kernels (`src/aji_rocm_color_device.hip`) are embedded as source and
+JIT-compiled per GPU with hipRTC at first run into `animejanai/cache/`, which is why the `.so`
+must contain zero baked device code (the `roc-obj-ls` check above). The build also produces
+`aji_rocm_compile` (the out-of-process MIGraphX engine compiler; ship it next to
+`libaji_rocm.so`) and the ROCm tests `aji_rocm_color_test`, `rife_harness`,
+`rife_pipeline_bench` and `rocm_rife_transcode`. Runtime requirements, the JIT cache and the
+color parity test are described in [`../BUILD.md`](../BUILD.md).
+
+Quick check (run from the repo root; the test reads `test/fixtures/`):
+
+```sh
+timeout -s KILL 300 ./build/aji_rocm_color_test    # expect maxdiff=0 for NV12 and P010
+```
+
+Wrap every headless ROCm run in `timeout -s KILL` — there are known hang modes at process
+exit.
+
+### `aji_vk` (ncnn-Vulkan)
+
+ncnn **must be built from source with Vulkan enabled** (`-DNCNN_VULKAN=ON`); the pip wheel
+and a stock package do not work here, and GPU RIFE additionally needs the `gridsample_vulkan`
+layer from the ncnn tree this branch was developed against. Point CMake at the ncnn source
+tree — it looks for `libncnn.so` in `<root>/build/src`, `<root>/build-fast/src` or
+`<root>/lib`, headers in `<root>/src`, and the generated `ncnn_export.h` next to the library:
+
+```sh
+cmake -B build -S . -DAJI_NCNN_ROOT=$HOME/Projects/ncnn-vk    # ncnn source tree, built in build/ or build-fast/
+cmake --build build -j
+```
+
+On success the configure prints `aji_vk (ncnn-Vulkan) backend: ENABLED (ncnn=...)`. The
+post-build step copies the `spv/` color kernels next to `libaji_vk.so`; at runtime the library
+finds them via `dladdr` (override with `AJI_VK_SPV_DIR`). `aji_vk` consumes ncnn
+`.param`/`.bin` models converted from the fp16 `.onnx` files, not the `.onnx` directly
+(`tools/rife_ncnn/` converts the RIFE models). There is no `build_aji_vk.sh` in this repo; the
+CMake target is the only build path.
+
+Do not bundle `libvulkan.so.1` (the loader) with a redistributable `aji_vk` — it must come from
+the target system, like the GPU ICD.
 
 ## CI: `Build Linux (aji)`
 

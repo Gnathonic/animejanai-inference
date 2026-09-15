@@ -14,7 +14,10 @@ endif()
 include(CheckLanguage)
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
-    enable_language(CUDA)
+    # CMAKE_CUDA_ARCHITECTURES must be set BEFORE the language is enabled (the
+    # upstream layout put it after project(LANGUAGES ... CUDA), where CMake had
+    # already pre-defined it, so the fallback never fired); shipping builds still
+    # pass the list explicitly.
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
         # Ship kernels for every supported GPU generation (Turing..Blackwell), NOT
         # "native": native builds only for the build machine's GPU, so the shipped
@@ -25,6 +28,7 @@ if(CMAKE_CUDA_COMPILER)
         # Local dev can still override with -DCMAKE_CUDA_ARCHITECTURES=native.
         set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 89-real 90-real 100-real 120-real 120-virtual)
     endif()
+    enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
     set(AJI_HAVE_CUDA ON)
 
@@ -209,14 +213,13 @@ else()
                    "(set -DAJI_NCNN_ROOT to your ncnn tree); skipping")
 endif()
 
-# aji_rocm: AMD ROCm/MIGraphX backend (the Linux/AMD real-time path; ~7-9x faster than
-# the retired ncnn-Vulkan aji_vk, TensorRT-class). Loaded by the dispatcher as
+# aji_rocm: AMD ROCm/MIGraphX backend (the Linux/AMD real-time path; TensorRT-class on
+# conv-only upscaling, where it leads aji_vk). Loaded by the dispatcher as
 # libaji_rocm.so. Runs the SAME fp16 .onnx as aji_trt/aji_dml on MIGraphX; CPU color via
 # resample.h (OpenMP). Needs MIGraphX (libmigraphx_c) + ROCm at AJI_ROCM_ROOT.
 set(AJI_ROCM_ROOT "/opt/rocm" CACHE PATH "ROCm install root (migraphx headers + libs)")
 find_library(AJI_MIGRAPHX_LIB NAMES migraphx_c PATHS "${AJI_ROCM_ROOT}/lib")
 find_library(AJI_HIP_LIB NAMES amdhip64 PATHS "${AJI_ROCM_ROOT}/lib")
-find_package(OpenMP)
 if(AJI_MIGRAPHX_LIB AND AJI_HIP_LIB AND EXISTS "${AJI_ROCM_ROOT}/include/migraphx/migraphx.hpp")
     # GPU-resident color (Phase B): aji_rocm_color_device.hip holds the YUV<->RGB +
     # chroma resample kernels; they are JIT-compiled per-GPU with hipRTC at runtime
