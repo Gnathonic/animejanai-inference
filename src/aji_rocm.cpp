@@ -56,7 +56,8 @@
 #include <condition_variable>
 #include <deque>
 #include <set>
-#include <chrono>   // AJI_ROCM_TIMING per-stage instrumentation
+#include <chrono>
+#include <map>   // AJI_ROCM_TIMING per-stage instrumentation
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -170,8 +171,14 @@ struct aji_ctx {
     std::string model_dir;
     int slot = 1;
 
-    // active plan (both modes)
-    std::vector<std::unique_ptr<MgxModel>> models;
+    // active plan (both modes). `models` points into `model_cache`, which owns every
+    // engine loaded during this context's life: a slot switch (or slot 0 passthrough)
+    // rebuilds the plan without freeing device buffers and re-reading the .mxr, so
+    // switching back is instant instead of a ~1-2 s stall that drops frames. Entries not
+    // in the current plan are evicted only past kModelCacheMax.
+    std::vector<MgxModel*> models;
+    std::map<std::string, std::unique_ptr<MgxModel>> model_cache;   // key = mxr cache path
+    static constexpr size_t kModelCacheMax = 6;
     std::vector<Step> steps;
     int chain_scale = 0;          // product of model scales (for aji_scale_factor)
     int in_w = 0, in_h = 0, out_w = 0, out_h = 0;
@@ -673,11 +680,27 @@ static int ensure_model(aji_ctx* c, const std::string& onnx, const std::string& 
                  " (first play at this resolution)";
         return 0;
     }
-    auto m = load_model(c, onnx, in_w, in_h, in_channels);
-    if (!m) { logmsg(c, 2, c->err.c_str()); return -1; }
-    int sc = m->scale;
-    c->models.push_back(std::move(m));
-    return sc;
+    const std::string key = mxr_cache_path(onnx, in_w, in_h, in_channels);
+    auto it = c->model_cache.find(key);
+    if (it == c->model_cache.end()) {
+        auto m = load_model(c, onnx, in_w, in_h, in_channels);
+        if (!m) { logmsg(c, 2, c->err.c_str()); return -1; }
+        it = c->model_cache.emplace(key, std::move(m)).first;
+    }
+    c->models.push_back(it->second.get());
+    return it->second->scale;
+}
+
+// Drop cached engines the current plan does not use once the cache outgrows its cap
+// (a passthrough plan uses none, so a plain on/off toggle never evicts anything).
+static void trim_model_cache(aji_ctx* c) {
+    if (c->model_cache.size() <= aji_ctx::kModelCacheMax) return;
+    for (auto it = c->model_cache.begin(); it != c->model_cache.end() &&
+                                           c->model_cache.size() > aji_ctx::kModelCacheMax;) {
+        bool used = false;
+        for (MgxModel* m : c->models) if (m == it->second.get()) { used = true; break; }
+        it = used ? std::next(it) : c->model_cache.erase(it);
+    }
 }
 
 // Configure RIFE interpolation for the active chain (called from build_plan, replacing
@@ -904,7 +927,7 @@ static int run_chain(aji_ctx* c, RgbMat& rgb_in, RgbMat& rgb_out, std::string* e
             if (gpu_resize(c, *cur, st.out_w, st.out_h, *alt) != AJI_OK) { if (errmsg) *errmsg = c->err; return AJI_ERR; }
             std::swap(cur, alt);
         } else {
-            MgxModel* nm = c->models[st.model_idx].get();
+            MgxModel* nm = c->models[st.model_idx];
             const int IW = cur->w, IH = cur->h;
             const size_t n = (size_t)3 * IW * IH;
             half_t* ib = c->scratch.mdl_in.get(n);
@@ -1004,7 +1027,7 @@ static bool gpu_color_ensure(aji_ctx* c, int W, int H, int fmt, int mat, int rng
 // the worker thread (the model output device buffer is consumed before the next eval).
 static int run_chain_gpu(aji_ctx* c, RgbMat& rgb_in, const aji_frame* out,
                          int ofmt, int omat, int orng, std::string* errmsg) {
-    MgxModel* nm = c->models[0].get();
+    MgxModel* nm = c->models[0];
     const int IW = rgb_in.w, IH = rgb_in.h;
     const size_t n = (size_t)3 * IW * IH;
     half_t* ib = c->scratch.mdl_in.get(n);
@@ -1178,6 +1201,7 @@ AJI_EXPORT int aji_configure(aji_ctx* c, int w, int h, double fps, int* out_w, i
     // so build_plan can clear/rebuild the model list with no chance of a concurrent chain.
     infer_worker_stop(c);
     int r = build_plan(c, w, h, fps);
+    trim_model_cache(c);
     if (r < 0) { return r; }
     if (out_w) *out_w = c->out_w;
     if (out_h) *out_h = c->out_h;
