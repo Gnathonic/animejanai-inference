@@ -1147,10 +1147,12 @@ AJI_EXPORT aji_ctx* aji_create(const aji_create_params* p) {
     // failed" to stderr — seen on macOS when the loader dylib was not on the search path.
     ncnn::create_gpu_instance();
     if (ncnn::get_gpu_count() <= 0) {
-        c->err = "aji_vk: no Vulkan device (loader/driver not found; on macOS the "
-                 "MoltenVK loader must sit next to libaji_vk or on DYLD_LIBRARY_PATH)";
-        logmsg(c, 2, c->err.c_str());
-        return c;
+        // Hard init failure: log and return NULL like aji_trt's cuInit/runtime failures,
+        // so the dispatcher reports a failed create instead of a half-built context.
+        logmsg(c, 2, "aji_vk: no Vulkan device (loader/driver not found; on macOS the "
+                     "MoltenVK loader must sit next to libaji_vk or on DYLD_LIBRARY_PATH)");
+        delete c;
+        return nullptr;
     }
 
     if (p->conf_path && p->conf_path[0]) {
