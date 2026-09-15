@@ -1,0 +1,140 @@
+From acc5a5e646ce6d6dfc2ae0ae012543c59105e833 Mon Sep 17 00:00:00 2001
+From: Nathan Rogers <gnathonic@gmail.com>
+Date: Tue, 15 Sep 2026 15:25:36 -0700
+Subject: [PATCH 2/2] fused winograd43: default on all GPUs (narrow inputs keep
+ coopmat gemm), per-GPU accumulation mode
+
+fp32 running sums (fp16 per 16-channel chunk) only on AMD coopmat GPUs where they are free;
+RDNA2 / NVIDIA / Apple keep fp16 accumulation (occupancy). Branch-free MAC loop.
+NCNN_WINO_ACC=16|32 overrides.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/layer/vulkan/convolution_vulkan.cpp       | 24 ++++++++++++-----
+ ...lution_pack4_3x3s1d1_winograd43_fused.comp | 26 ++++++++++++++-----
+ 2 files changed, 37 insertions(+), 13 deletions(-)
+
+diff --git a/src/layer/vulkan/convolution_vulkan.cpp b/src/layer/vulkan/convolution_vulkan.cpp
+index e9cad5e..50e1419 100644
+--- a/src/layer/vulkan/convolution_vulkan.cpp
++++ b/src/layer/vulkan/convolution_vulkan.cpp
+@@ -206,10 +206,11 @@ int Convolution_vulkan::create_pipeline(const Option& opt)
+         const bool env_ok = !(env && env[0] == '0');
+         const bool env_force = env && env[0] == '2';
+         const bool cm = vkdev->info.support_cooperative_matrix() && opt.use_cooperative_matrix && (opt.use_fp16_storage || opt.use_fp16_packed);
+-        // measured faster than the coopmat winograd on AMD RDNA3/4 too (RX 9070 XT: 1.33 vs 1.97 ms), so
+-        // AMD always takes it; other coopmat vendors keep ncnn's coopmat path unless forced
+-        const bool amd = vkdev->info.vendor_id() == 0x1002;
+-        use_winograd43_fused = env_ok && (!cm || amd || env_force)
++        // measured faster than ncnn's coopmat winograd on every GPU tried (RX 9070 XT 1.33 vs 1.97 ms,
++        // RTX 4090 0.56 vs 0.93 ms), so it is the default everywhere; NCNN_WINO_FUSED=0 reverts.
++        // Narrow inputs (< 16 ch) stay on the coopmat gemm where one exists (faster and exact there).
++        (void)env_force;
++        use_winograd43_fused = env_ok && (num_input >= 16 || !cm)
+                                && opt.use_winograd_convolution && opt.use_winograd43_convolution && is_conv3x3s1d1
+                                && elempack == 4 && out_elempack == 4 && num_output <= 64
+                                && pad_left == 1 && pad_right == 1 && pad_top == 1 && pad_bottom == 1
+@@ -588,14 +589,25 @@ int Convolution_vulkan::create_pipeline(const Option& opt)
+ 
+             if (use_winograd43_fused)
+             {
+-                std::vector<vk_specialization_type> specializations(6 + 8);
++                std::vector<vk_specialization_type> specializations(7 + 8);
+                 specializations[0].i = num_input / elempack;
+                 specializations[1].i = num_output / out_elempack;
+                 specializations[2].i = bias_term;
+                 specializations[3].i = activation_type;
+                 specializations[4].f = activation_params.w >= 1 ? activation_params[0] : 0.f;
+                 specializations[5].f = activation_params.w == 2 ? activation_params[1] : 0.f;
+-                for (int i = 0; i < 8; i++) specializations[6 + i].i = 0;   // shapes via push constants
++                // fp32 running sums only where they are free: AMD RDNA3/4 (RX 9070 XT 1.33 ms either
++                // way). They cost occupancy elsewhere (RX 6900 XT 1.01 -> 1.60 ms, RTX 4090 0.56 -> 1.14 ms),
++                // so RDNA2, NVIDIA and Apple keep fp16 accumulation (ncnn's own non-coopmat precision).
++                // NCNN_WINO_ACC=16|32 overrides.
++                {
++                    const char* acc_env = getenv("NCNN_WINO_ACC");
++                    int acc32 = (vkdev->info.vendor_id() == 0x1002 && vkdev->info.support_cooperative_matrix()) ? 1 : 0;
++                    if (acc_env && acc_env[0] == '1') acc32 = 0;
++                    if (acc_env && acc_env[0] == '3') acc32 = 1;
++                    specializations[6].i = acc32;
++                }
++                for (int i = 0; i < 8; i++) specializations[7 + i].i = 0;   // shapes via push constants
+ 
+                 pipeline_convolution_3x3s1d1_winograd43_fused = new Pipeline(vkdev);
+                 pipeline_convolution_3x3s1d1_winograd43_fused->set_local_size_xyz(512, 1, 1);
+diff --git a/src/layer/vulkan/shader/convolution_pack4_3x3s1d1_winograd43_fused.comp b/src/layer/vulkan/shader/convolution_pack4_3x3s1d1_winograd43_fused.comp
+index 7a465db..c24d521 100644
+--- a/src/layer/vulkan/shader/convolution_pack4_3x3s1d1_winograd43_fused.comp
++++ b/src/layer/vulkan/shader/convolution_pack4_3x3s1d1_winograd43_fused.comp
+@@ -26,8 +26,9 @@ layout (constant_id = 2) const int bias_term = 0;
+ layout (constant_id = 3) const int activation_type = 0;
+ layout (constant_id = 4) const float activation_param_0 = 0;
+ layout (constant_id = 5) const float activation_param_1 = 0;
++layout (constant_id = 6) const int acc_fp32 = 0;     // 1: fp32 running sums (per-chunk fp16 partials folded in)
+ 
+-#define shape_constant_id_offset 6
++#define shape_constant_id_offset 7
+ layout (constant_id = shape_constant_id_offset + 0) const int w = 0;
+ layout (constant_id = shape_constant_id_offset + 1) const int h = 0;
+ layout (constant_id = shape_constant_id_offset + 2) const int cstep = 0;
+@@ -84,9 +85,15 @@ void main()
+     const int o = tid & 15;          // oc quad
+     const bool o_valid = o < outc;   // OC < 64: idle oc-quad lanes
+ 
++    // acc_fp32 == 0: fp16 accumulators across all C (fastest; RDNA2/Apple register budget).
++    // acc_fp32 == 1: fp32 running sums, each 16-channel chunk accumulated in fp16 (packed math)
++    // then folded in, so the error is that of a 16-term fp16 sum (~ncnn's fp32-accumulating
++    // coopmat path); costs ~72 more VGPRs, neutral on RDNA4 / Ada.
+     afpvec4 acc0[9];
+     afpvec4 acc1[9];
+-    for (int i = 0; i < 9; i++) { acc0[i] = afpvec4(0.f); acc1[i] = afpvec4(0.f); }
++    vec4 facc0[9];
++    vec4 facc1[9];
++    for (int i = 0; i < 9; i++) { acc0[i] = afpvec4(0.f); acc1[i] = afpvec4(0.f); facc0[i] = vec4(0.f); facc1[i] = vec4(0.f); }
+ 
+     // ---- input transform thread mapping (384 of 512 threads) ----
+     // task = (tile t in 0..15, ic quad iq in 0..3, lane j in 0..5)
+@@ -161,14 +168,17 @@ void main()
+         barrier();
+ 
+         // ---- MAC: acc[pp][t] += X[p][t][ic] * W[p][ic][o] over the 16 ic of this chunk ----
++        // Branch-free, fully unrolled: X is zero for ic >= C (partial last chunk), and the weight
++        // index is clamped into range so those lanes multiply finite weights by zero.
++        if (o_valid)
+         {
+             const int t0 = tp * 2;
+             const int t1 = tp * 2 + 1;
++            if (acc_fp32 == 1)
++                for (int i = 0; i < 9; i++) { acc0[i] = afpvec4(0.f); acc1[i] = afpvec4(0.f); }
+             for (int ip = 0; ip < ICC / 2; ip++)
+             {
+-                const int ic = ch * ICC + ip * 2;
+-                if (ic >= C || !o_valid)
+-                    continue;
++                const int ic = min(ch * ICC + ip * 2, C - 2);
+                 for (int pp = 0; pp < 9; pp++)
+                 {
+                     const int pos = g * 9 + pp;
+@@ -182,6 +192,8 @@ void main()
+                     acc1[pp] += xb.r * w0 + xb.g * w1;
+                 }
+             }
++            if (acc_fp32 == 1)
++                for (int i = 0; i < 9; i++) { facc0[i] += vec4(acc0[i]); facc1[i] += vec4(acc1[i]); }
+         }
+         barrier();
+     }
+@@ -204,8 +216,8 @@ void main()
+             for (int pp = 0; pp < 9; pp++)
+             {
+                 const int pos = g * 9 + pp;
+-                Ys[(pos * NT + tp * 2) * 8 + oq] = acc0[pp];
+-                Ys[(pos * NT + tp * 2 + 1) * 8 + oq] = acc1[pp];
++                Ys[(pos * NT + tp * 2) * 8 + oq] = acc_fp32 == 1 ? afpvec4(facc0[pp]) : acc0[pp];
++                Ys[(pos * NT + tp * 2 + 1) * 8 + oq] = acc_fp32 == 1 ? afpvec4(facc1[pp]) : acc1[pp];
+             }
+         }
+         barrier();
+-- 
+2.55.0
+

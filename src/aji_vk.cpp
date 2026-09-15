@@ -291,6 +291,8 @@ static void apply_vk_model_opts(ncnn::Option& o) {
     const bool has_cm = ncnn::get_gpu_count() > 0 &&
                         ncnn::get_gpu_info(ncnn::get_default_gpu_index()).support_cooperative_matrix();
     o.use_winograd_convolution = env_flag("AJI_VK_WINOGRAD", !has_cm);
+    o.use_winograd23_convolution = env_flag("AJI_VK_WINO23", true);   // ncnn picks 43 over 23 unless tiny
+    o.use_winograd43_convolution = env_flag("AJI_VK_WINO43", true);
     o.use_sgemm_convolution = env_flag("AJI_VK_SGEMM", true);
     o.use_subgroup_ops = env_flag("AJI_VK_SUBGROUP", true);
     o.use_shader_local_memory = env_flag("AJI_VK_LOCALMEM", true);
@@ -967,6 +969,14 @@ static int run_gpu_post(aji_ctx* c, aji_ctx::GpBuf& b, ncnn::VkAllocator* blob, 
     if (use_gpu_in && !gpu_in(c, b, blob, staging, s, vModelIn)) { logmsg(c, 2, c->err.c_str()); return AJI_ERR; }
     ncnn::VkMat vRGB;
     { ncnn::VkCompute cmd(vkdev);
+#if NCNN_BENCHMARK
+      // Per-layer GPU timestamps (ncnn built with -DNCNN_BENCHMARK=ON): forward_layer writes a
+      // timestamp pair per layer into OUR command buffer, so the pool must exist here. Means
+      // are printed every 30 frames (frame 1 skipped: pipeline warm-up).
+      const size_t nl = nm->net.layers().size();
+      cmd.create_query_pool((uint32_t)(nl * 2));
+      static std::vector<double> lay_us; static long lay_n = 0; if (lay_us.size() != nl) { lay_us.assign(nl, 0); lay_n = 0; }
+#endif
       { ncnn::Extractor ex = nm->net.create_extractor();
         ex.set_blob_vkallocator(blob); ex.set_workspace_vkallocator(blob); ex.set_staging_vkallocator(staging);
         if (use_gpu_in) ex.input(nm->in_name.c_str(), vModelIn); else ex.input(nm->in_name.c_str(), rgb_in);
@@ -990,7 +1000,17 @@ static int run_gpu_post(aji_ctx* c, aji_ctx::GpBuf& b, ncnn::VkAllocator* blob, 
       } else {
           cmd.record_download(b.Yout, b.oy, popt); cmd.record_download(b.uvout, b.ouv, popt);
       }
-      if (cmd.submit_and_wait() != 0) { c->err = "gp: fused submit"; return AJI_ERR; } }
+      if (cmd.submit_and_wait() != 0) { c->err = "gp: fused submit"; return AJI_ERR; }
+#if NCNN_BENCHMARK
+      { std::vector<uint64_t> q(nl * 2); cmd.get_query_pool_results(0, (uint32_t)(nl * 2), q);
+        static long seen = 0; seen++;
+        if (seen > 1) { lay_n++; double tot = 0;
+          for (size_t i = 0; i < nl; i++) if (q[2*i] && q[2*i+1]) { double us = (double)(q[2*i+1] - q[2*i]) * vkdev->info.timestamp_period() / 1000.0; lay_us[i] += us; tot += us; }
+          if (lay_n % 30 == 0) { fprintf(stderr, "[aji_vk layer profile: mean us over %ld frames]\n", lay_n); double sum = 0;
+            for (size_t i = 0; i < nl; i++) { const ncnn::Layer* l = nm->net.layers()[i]; fprintf(stderr, "  %-16s %-28s %10.1f us\n", l->type.c_str(), l->name.c_str(), lay_us[i] / lay_n); sum += lay_us[i] / lay_n; }
+            fprintf(stderr, "  TOTAL %.1f us\n", sum); } } }
+#endif
+    }
     double tt1 = kTiming ? aji_now() : 0;
     { static bool once=false; if(!once && !c->packed_dl && getenv("AJI_VK_GPDBG")){ once=true;
         const float* yf=(const float*)b.oy.data; double s=0,mn=1e9,mx=-1e9; long t=(long)W2*H2,nz=0;

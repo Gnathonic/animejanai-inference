@@ -1,0 +1,1266 @@
+From 56c91fee139f861b17de236b26bcf028b0c2d512 Mon Sep 17 00:00:00 2001
+From: Nathan Rogers <gnathonic@gmail.com>
+Date: Tue, 15 Sep 2026 15:18:52 -0700
+Subject: [PATCH 1/2] animejanai: fused winograd43 conv for non-coopmat GPUs,
+ SpabTail fused layer, GridSample Vulkan layer
+
+- convolution_vulkan: single-dispatch fused winograd F(4x4,3x3) (transforms staged in LDS, no
+  VRAM intermediates) for pack4 fp16 3x3 s1 pad-1 convs with <=64 output channels. Default on
+  GPUs without cooperative matrix and on AMD; NCNN_WINO_FUSED=0/1/2 to disable/enable/force.
+  RX 6900 XT 960x540 64->64: 2.75 -> 1.01 ms; RX 9070 XT: 1.97 (coopmat) -> 1.33 ms.
+- SpabTail layer: out = (res + x) * tanh(W1x1 x + b) in one pass (SPAN SPAB block tail).
+- net.cpp: NCNN_DISPATCH_THRESHOLD env overrides the mid-forward flush threshold (profiling).
+- GridSample Vulkan layer (RIFE warps) that was previously uncommitted in this tree.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/CMakeLists.txt                            |   1 +
+ src/layer/spabtail.cpp                        |  77 +++++
+ src/layer/spabtail.h                          |  38 +++
+ src/layer/vulkan/convolution_vulkan.cpp       | 118 +++++++-
+ src/layer/vulkan/convolution_vulkan.h         |   6 +
+ src/layer/vulkan/gridsample_vulkan.cpp        |  95 ++++++
+ src/layer/vulkan/gridsample_vulkan.h          |  28 ++
+ ...lution_pack4_3x3s1d1_winograd43_fused.comp | 274 ++++++++++++++++++
+ src/layer/vulkan/shader/gridsample.comp       | 183 ++++++++++++
+ src/layer/vulkan/shader/spabtail_pack4.comp   |  74 +++++
+ src/layer/vulkan/spabtail_vulkan.cpp          | 109 +++++++
+ src/layer/vulkan/spabtail_vulkan.h            |  33 +++
+ src/net.cpp                                   |   8 +
+ 13 files changed, 1040 insertions(+), 4 deletions(-)
+ create mode 100644 src/layer/spabtail.cpp
+ create mode 100644 src/layer/spabtail.h
+ create mode 100644 src/layer/vulkan/gridsample_vulkan.cpp
+ create mode 100644 src/layer/vulkan/gridsample_vulkan.h
+ create mode 100644 src/layer/vulkan/shader/convolution_pack4_3x3s1d1_winograd43_fused.comp
+ create mode 100644 src/layer/vulkan/shader/gridsample.comp
+ create mode 100644 src/layer/vulkan/shader/spabtail_pack4.comp
+ create mode 100644 src/layer/vulkan/spabtail_vulkan.cpp
+ create mode 100644 src/layer/vulkan/spabtail_vulkan.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 614c3b8..7f8e264 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -161,6 +161,7 @@ ncnn_add_layer(GLU)
+ ncnn_add_layer(Fold)
+ ncnn_add_layer(Unfold)
+ ncnn_add_layer(GridSample)
++ncnn_add_layer(SpabTail)
+ ncnn_add_layer(CumulativeSum)
+ ncnn_add_layer(CopyTo)
+ ncnn_add_layer(Erf)
+diff --git a/src/layer/spabtail.cpp b/src/layer/spabtail.cpp
+new file mode 100644
+index 0000000..fe0f766
+--- /dev/null
++++ b/src/layer/spabtail.cpp
+@@ -0,0 +1,77 @@
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "spabtail.h"
++
++#include <math.h>
++
++namespace ncnn {
++
++SpabTail::SpabTail()
++{
++    one_blob_only = false;
++    support_inplace = false;
++    support_packing = false;   // CPU reference path works on elempack 1
++}
++
++int SpabTail::load_param(const ParamDict& pd)
++{
++    num_output = pd.get(0, 0);
++    num_input = pd.get(1, 0);
++    bias_term = pd.get(2, 0);
++    weight_data_size = pd.get(3, 0);
++    if (num_output <= 0 || num_input <= 0 || weight_data_size != num_output * num_input)
++        return -1;
++    return 0;
++}
++
++int SpabTail::load_model(const ModelBin& mb)
++{
++    weight_data = mb.load(weight_data_size, 0);
++    if (weight_data.empty())
++        return -100;
++
++    if (bias_term)
++    {
++        bias_data = mb.load(num_output, 1);
++        if (bias_data.empty())
++            return -100;
++    }
++
++    return 0;
++}
++
++int SpabTail::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const
++{
++    const Mat& res = bottom_blobs[0];
++    const Mat& x = bottom_blobs[1];
++    if (x.dims != 3 || x.c != num_input || res.c != num_output || res.w != x.w || res.h != x.h)
++        return -1;
++
++    Mat& top_blob = top_blobs[0];
++    top_blob.create(x.w, x.h, num_output, x.elemsize, opt.blob_allocator);
++    if (top_blob.empty())
++        return -100;
++
++    const int size = x.w * x.h;
++
++    #pragma omp parallel for num_threads(opt.num_threads)
++    for (int o = 0; o < num_output; o++)
++    {
++        const float* w = (const float*)weight_data + o * num_input;
++        const float b = bias_term ? bias_data[o] : 0.f;
++        const float* r = res.channel(o);
++        const float* xo = x.channel(o);
++        float* out = top_blob.channel(o);
++        for (int i = 0; i < size; i++)
++        {
++            float att = b;
++            for (int q = 0; q < num_input; q++)
++                att += w[q] * x.channel(q)[i];
++            out[i] = (r[i] + xo[i]) * tanhf(att);
++        }
++    }
++
++    return 0;
++}
++
++} // namespace ncnn
+diff --git a/src/layer/spabtail.h b/src/layer/spabtail.h
+new file mode 100644
+index 0000000..371d4f5
+--- /dev/null
++++ b/src/layer/spabtail.h
+@@ -0,0 +1,38 @@
++// SPDX-License-Identifier: BSD-3-Clause
++// SpabTail: fused tail of a SPAN "SPAB" block
++//   out = (res + x) * tanh(W_att * x + b_att)      (W_att = 1x1 convolution, num_input -> num_output)
++// Replaces Split / BinaryOp(add) / Convolution 1x1 / TanH / BinaryOp(mul) — five memory-bound passes —
++// with one pass (the elementwise chain is VRAM-bandwidth bound on large feature maps).
++//   bottom[0] = res (residual input), bottom[1] = x (the block's conv3 output)
++//   param: 0=num_output 1=num_input 2=bias_term 3=weight_data_size ; model: weights (as Convolution), bias
++
++#ifndef LAYER_SPABTAIL_H
++#define LAYER_SPABTAIL_H
++
++#include "layer.h"
++
++namespace ncnn {
++
++class SpabTail : public Layer
++{
++public:
++    SpabTail();
++
++    virtual int load_param(const ParamDict& pd);
++    virtual int load_model(const ModelBin& mb);
++
++    virtual int forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt) const;
++
++public:
++    int num_output;
++    int num_input;
++    int bias_term;
++    int weight_data_size;
++
++    Mat weight_data;   // [num_output][num_input]
++    Mat bias_data;
++};
++
++} // namespace ncnn
++
++#endif // LAYER_SPABTAIL_H
+diff --git a/src/layer/vulkan/convolution_vulkan.cpp b/src/layer/vulkan/convolution_vulkan.cpp
+index c06537b..e9cad5e 100644
+--- a/src/layer/vulkan/convolution_vulkan.cpp
++++ b/src/layer/vulkan/convolution_vulkan.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+ #include "convolution_vulkan.h"
++#include <stdlib.h>
+ 
+ #include "layer_shader_type.h"
+ #include "layer_type.h"
+@@ -27,6 +28,8 @@ Convolution_vulkan::Convolution_vulkan()
+     pipeline_convolution_3x3s1d1_winograd43_transform_input = 0;
+     pipeline_convolution_3x3s1d1_winograd43_gemm = 0;
+     pipeline_convolution_3x3s1d1_winograd43_transform_output = 0;
++    pipeline_convolution_3x3s1d1_winograd43_fused = 0;
++    use_winograd43_fused = false;
+ 
+     reshape_1x1xw = 0;
+     reshape_w = 0;
+@@ -195,7 +198,26 @@ int Convolution_vulkan::create_pipeline(const Option& opt)
+         padding->create_pipeline(opt);
+     }
+ 
+-    if (opt.use_winograd_convolution && (opt.use_winograd23_convolution || opt.use_winograd43_convolution) && is_conv3x3s1d1 && num_input >= 16 && num_output >= 16)
++    // fused single-dispatch winograd43 (GPUs without cooperative matrix; NCNN_WINO_FUSED=0 disables,
++    // =2 forces it on coopmat GPUs for A/B). Decided up front because it also lifts the
++    // num_input >= 16 floor of the 3-kernel winograd path.
++    {
++        const char* env = getenv("NCNN_WINO_FUSED");
++        const bool env_ok = !(env && env[0] == '0');
++        const bool env_force = env && env[0] == '2';
++        const bool cm = vkdev->info.support_cooperative_matrix() && opt.use_cooperative_matrix && (opt.use_fp16_storage || opt.use_fp16_packed);
++        // measured faster than the coopmat winograd on AMD RDNA3/4 too (RX 9070 XT: 1.33 vs 1.97 ms), so
++        // AMD always takes it; other coopmat vendors keep ncnn's coopmat path unless forced
++        const bool amd = vkdev->info.vendor_id() == 0x1002;
++        use_winograd43_fused = env_ok && (!cm || amd || env_force)
++                               && opt.use_winograd_convolution && opt.use_winograd43_convolution && is_conv3x3s1d1
++                               && elempack == 4 && out_elempack == 4 && num_output <= 64
++                               && pad_left == 1 && pad_right == 1 && pad_top == 1 && pad_bottom == 1
++                               && opt.use_fp16_storage && opt.use_fp16_arithmetic
++                               && (activation_type >= 0 && activation_type <= 3);
++    }
++
++    if (opt.use_winograd_convolution && (opt.use_winograd23_convolution || opt.use_winograd43_convolution) && is_conv3x3s1d1 && ((num_input >= 16 && num_output >= 16) || use_winograd43_fused))
+     {
+         use_cooperative_matrix = vkdev->info.support_cooperative_matrix() && opt.use_cooperative_matrix && (opt.use_fp16_storage || opt.use_fp16_packed);
+ 
+@@ -427,6 +449,19 @@ int Convolution_vulkan::create_pipeline(const Option& opt)
+                     }
+                 }
+             }
++
++            if (use_winograd43_fused)
++            {
++                // [36 pos][C/2 ic pairs][OC/4 oc quads][2 ic][4 oc] — 16 B per (pos, ic pair, oc quad)
++                weight_winograd43_fused_data.create(36 * num_input * num_output);
++                float* dst = weight_winograd43_fused_data;
++                for (int k = 0; k < 36; k++)
++                    for (int pi = 0; pi < num_input / 2; pi++)
++                        for (int oq = 0; oq < num_output / 4; oq++)
++                            for (int j = 0; j < 2; j++)
++                                for (int i = 0; i < 4; i++)
++                                    *dst++ = weight_data_tm.channel(oq * 4 + i).row(pi * 2 + j)[k];
++            }
+         }
+ 
+         // winograd43
+@@ -550,6 +585,22 @@ int Convolution_vulkan::create_pipeline(const Option& opt)
+                 pipeline_convolution_3x3s1d1_winograd43_transform_output->set_local_size_xyz(4, 4, 1);
+                 pipeline_convolution_3x3s1d1_winograd43_transform_output->create(shader_type_index, opt, specializations);
+             }
++
++            if (use_winograd43_fused)
++            {
++                std::vector<vk_specialization_type> specializations(6 + 8);
++                specializations[0].i = num_input / elempack;
++                specializations[1].i = num_output / out_elempack;
++                specializations[2].i = bias_term;
++                specializations[3].i = activation_type;
++                specializations[4].f = activation_params.w >= 1 ? activation_params[0] : 0.f;
++                specializations[5].f = activation_params.w == 2 ? activation_params[1] : 0.f;
++                for (int i = 0; i < 8; i++) specializations[6 + i].i = 0;   // shapes via push constants
++
++                pipeline_convolution_3x3s1d1_winograd43_fused = new Pipeline(vkdev);
++                pipeline_convolution_3x3s1d1_winograd43_fused->set_local_size_xyz(512, 1, 1);
++                pipeline_convolution_3x3s1d1_winograd43_fused->create(LayerShaderType::convolution_pack4_3x3s1d1_winograd43_fused, opt, specializations);
++            }
+         }
+ 
+         // winograd23 transform kernel
+@@ -1516,6 +1567,8 @@ int Convolution_vulkan::destroy_pipeline(const Option& opt)
+     pipeline_convolution_3x3s1d1_winograd43_transform_input = 0;
+     pipeline_convolution_3x3s1d1_winograd43_gemm = 0;
+     pipeline_convolution_3x3s1d1_winograd43_transform_output = 0;
++    delete pipeline_convolution_3x3s1d1_winograd43_fused;
++    pipeline_convolution_3x3s1d1_winograd43_fused = 0;
+ 
+ #if NCNN_INT8
+     delete pipeline_convolution_3x3s1d1_winograd23_gemm_int8_cm;
+@@ -1580,7 +1633,7 @@ int Convolution_vulkan::upload_model(VkTransfer& cmd, const Option& opt)
+ 
+     bool is_conv3x3s1d1 = kernel_w == 3 && kernel_h == 3 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1;
+ 
+-    if (opt.use_winograd_convolution && (opt.use_winograd23_convolution || opt.use_winograd43_convolution) && is_conv3x3s1d1 && num_input >= 16 && num_output >= 16)
++    if (opt.use_winograd_convolution && (opt.use_winograd23_convolution || opt.use_winograd43_convolution) && is_conv3x3s1d1 && ((num_input >= 16 && num_output >= 16) || use_winograd43_fused))
+     {
+         // winograd43
+         if (opt.use_winograd43_convolution)
+@@ -1588,6 +1641,12 @@ int Convolution_vulkan::upload_model(VkTransfer& cmd, const Option& opt)
+             cmd.record_upload(weight_winograd43_data_packed, weight_data_gpu_tm_winograd43, opt);
+ 
+             weight_winograd43_data_packed.release();
++
++            if (use_winograd43_fused)
++            {
++                cmd.record_upload(weight_winograd43_fused_data, weight_data_gpu_tm_winograd43_fused, opt);
++                weight_winograd43_fused_data.release();
++            }
+         }
+ 
+         // winograd23
+@@ -1661,8 +1720,24 @@ int Convolution_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCom
+     const int kernel_extent_w = dilation_w * (kernel_w - 1) + 1;
+     const int kernel_extent_h = dilation_h * (kernel_h - 1) + 1;
+ 
++    // fused winograd43: the kernel pads implicitly, and takes over exactly the cases the
++    // 3-kernel path would run as winograd43 (same size heuristic as below, on padded dims)
++    bool fused_now = false;
++    if (use_winograd43_fused && bottom_blob.dims == 3 && elempack == 4)
++    {
++        const int wb = w + 2, hb = h + 2;
++        fused_now = true;
++        if (opt.use_winograd23_convolution)
++        {
++            if (vkdev->info.type() == 0 && ((wb <= 18 && hb <= 18) || ((wb >= 23 && wb <= 24) && (hb >= 23 && hb <= 24))))
++                fused_now = false;
++            if (vkdev->info.type() != 0 && (wb <= 12 && hb <= 12))
++                fused_now = false;
++        }
++    }
++
+     VkMat bottom_blob_bordered = bottom_blob;
+-    if (pad_left > 0 || pad_right > 0 || pad_top > 0 || pad_bottom > 0)
++    if (!fused_now && (pad_left > 0 || pad_right > 0 || pad_top > 0 || pad_bottom > 0))
+     {
+         Option opt_pad = opt;
+         opt_pad.blob_vkallocator = opt.workspace_vkallocator;
+@@ -1739,7 +1814,7 @@ int Convolution_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCom
+     bool is_conv1x1s1d1 = kernel_w == 1 && kernel_h == 1 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1;
+     bool is_conv3x3s1d1 = kernel_w == 3 && kernel_h == 3 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1;
+ 
+-    if (opt.use_winograd_convolution && (opt.use_winograd23_convolution || opt.use_winograd43_convolution) && is_conv3x3s1d1 && num_input >= 16 && num_output >= 16)
++    if (opt.use_winograd_convolution && (opt.use_winograd23_convolution || opt.use_winograd43_convolution) && is_conv3x3s1d1 && ((num_input >= 16 && num_output >= 16) || use_winograd43_fused))
+     {
+         bool pre_winograd43 = opt.use_winograd43_convolution;
+         if (opt.use_winograd23_convolution)
+@@ -1753,6 +1828,41 @@ int Convolution_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCom
+                 pre_winograd43 = false;
+         }
+ 
++        if (fused_now)
++        {
++            const int fw = bottom_blob.w, fh = bottom_blob.h;   // pad 1 -> same size
++            const int block_x = (fw + 3) / 4;
++            const int block_y = (fh + 3) / 4;
++
++            top_blob.create(fw, fh, num_output / out_elempack, out_elemsize, out_elempack, opt.blob_vkallocator);
++            if (top_blob.empty())
++                return -100;
++
++            std::vector<VkMat> bindings(4);
++            bindings[0] = bottom_blob;
++            bindings[1] = top_blob;
++            bindings[2] = weight_data_gpu_tm_winograd43_fused;
++            bindings[3] = bias_data_gpu;
++
++            std::vector<vk_constant_type> constants(8);
++            constants[0].i = fw;
++            constants[1].i = fh;
++            constants[2].i = bottom_blob.cstep;
++            constants[3].i = fw;
++            constants[4].i = fh;
++            constants[5].i = top_blob.cstep;
++            constants[6].i = block_x;
++            constants[7].i = block_y;
++
++            VkMat dispatcher;
++            dispatcher.w = ((block_x + 3) / 4) * 512;
++            dispatcher.h = (block_y + 3) / 4;
++            dispatcher.c = 1;
++
++            cmd.record_pipeline(pipeline_convolution_3x3s1d1_winograd43_fused, bindings, constants, dispatcher);
++            return 0;
++        }
++
+         if (pre_winograd43)
+         {
+             // winograd43
+diff --git a/src/layer/vulkan/convolution_vulkan.h b/src/layer/vulkan/convolution_vulkan.h
+index d03c095..b93091a 100644
+--- a/src/layer/vulkan/convolution_vulkan.h
++++ b/src/layer/vulkan/convolution_vulkan.h
+@@ -55,6 +55,12 @@ public:
+     Pipeline* pipeline_convolution_3x3s1d1_winograd43_gemm;
+     Pipeline* pipeline_convolution_3x3s1d1_winograd43_transform_output;
+ 
++    // fused winograd43 (single dispatch; GPUs without cooperative matrix) — see the shader header
++    bool use_winograd43_fused;
++    Mat weight_winograd43_fused_data;          // [36][C][OC] fp32, uploaded as fp16
++    VkMat weight_data_gpu_tm_winograd43_fused;
++    Pipeline* pipeline_convolution_3x3s1d1_winograd43_fused;
++
+     // convolution as fc
+     ncnn::Layer* reshape_1x1xw;
+     ncnn::Layer* reshape_w;
+diff --git a/src/layer/vulkan/gridsample_vulkan.cpp b/src/layer/vulkan/gridsample_vulkan.cpp
+new file mode 100644
+index 0000000..b788689
+--- /dev/null
++++ b/src/layer/vulkan/gridsample_vulkan.cpp
+@@ -0,0 +1,95 @@
++// Copyright 2026 Tencent
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "gridsample_vulkan.h"
++
++#include "layer_shader_type.h"
++
++namespace ncnn {
++
++GridSample_vulkan::GridSample_vulkan()
++{
++    support_vulkan = true;
++    support_vulkan_packing = false; // operate on unpacked elempack=1 buffers (ncnn inserts Packing)
++
++    pipeline_gridsample = 0;
++}
++
++int GridSample_vulkan::create_pipeline(const Option& opt)
++{
++    // only the mode params are baked as specialization constants; all shapes go
++    // through push constants (psc -> p.x when the spec const is 0), so a single
++    // pipeline serves every (dynamic) resolution.
++    std::vector<vk_specialization_type> specializations(4 + 9);
++    specializations[0].i = sample_type;
++    specializations[1].i = padding_mode;
++    specializations[2].i = align_corner;
++    specializations[3].i = permute_fusion;
++    // shape specialization constants left 0 so psc() falls through to push
++    // constants -> a single pipeline serves every (dynamic) resolution.
++    for (int k = 0; k < 9; k++)
++        specializations[4 + k].i = 0;
++
++    pipeline_gridsample = new Pipeline(vkdev);
++    pipeline_gridsample->set_optimal_local_size_xyz(8, 8, 1);
++    pipeline_gridsample->create(LayerShaderType::gridsample, opt, specializations);
++
++    return 0;
++}
++
++int GridSample_vulkan::destroy_pipeline(const Option& /*opt*/)
++{
++    delete pipeline_gridsample;
++    pipeline_gridsample = 0;
++
++    return 0;
++}
++
++int GridSample_vulkan::forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkMat>& top_blobs, VkCompute& cmd, const Option& opt) const
++{
++    const VkMat& bottom_blob = bottom_blobs[0]; // image  [w, h, c]
++    const VkMat& grid = bottom_blobs[1];        // grid
++
++    size_t elemsize = bottom_blob.elemsize;
++    int channels = bottom_blob.c;
++
++    // output spatial dims follow the grid layout (mirrors the CPU layer)
++    int outw, outh;
++    if (permute_fusion == 0)
++    {
++        outw = grid.h;
++        outh = grid.c;
++    }
++    else
++    {
++        outw = grid.w;
++        outh = grid.h;
++    }
++
++    VkMat& top_blob = top_blobs[0];
++    top_blob.create(outw, outh, channels, elemsize, 1, opt.blob_vkallocator);
++    if (top_blob.empty())
++        return -100;
++
++    std::vector<VkMat> bindings(3);
++    bindings[0] = bottom_blob;
++    bindings[1] = grid;
++    bindings[2] = top_blob;
++
++    std::vector<vk_constant_type> constants(9);
++    constants[0].i = bottom_blob.w;
++    constants[1].i = bottom_blob.h;
++    constants[2].i = channels;
++    constants[3].i = bottom_blob.cstep;
++    constants[4].i = grid.w;
++    constants[5].i = grid.cstep;
++    constants[6].i = top_blob.w;
++    constants[7].i = top_blob.h;
++    constants[8].i = top_blob.cstep;
++
++    cmd.record_pipeline(pipeline_gridsample, bindings, constants, top_blob);
++
++    return 0;
++}
++
++} // namespace ncnn
+diff --git a/src/layer/vulkan/gridsample_vulkan.h b/src/layer/vulkan/gridsample_vulkan.h
+new file mode 100644
+index 0000000..793238a
+--- /dev/null
++++ b/src/layer/vulkan/gridsample_vulkan.h
+@@ -0,0 +1,28 @@
++// Copyright 2026 Tencent
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef LAYER_GRIDSAMPLE_VULKAN_H
++#define LAYER_GRIDSAMPLE_VULKAN_H
++
++#include "gridsample.h"
++
++namespace ncnn {
++
++class GridSample_vulkan : public GridSample
++{
++public:
++    GridSample_vulkan();
++
++    virtual int create_pipeline(const Option& opt);
++    virtual int destroy_pipeline(const Option& opt);
++
++    using GridSample::forward;
++    virtual int forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkMat>& top_blobs, VkCompute& cmd, const Option& opt) const;
++
++public:
++    Pipeline* pipeline_gridsample;
++};
++
++} // namespace ncnn
++
++#endif // LAYER_GRIDSAMPLE_VULKAN_H
+diff --git a/src/layer/vulkan/shader/convolution_pack4_3x3s1d1_winograd43_fused.comp b/src/layer/vulkan/shader/convolution_pack4_3x3s1d1_winograd43_fused.comp
+new file mode 100644
+index 0000000..7a465db
+--- /dev/null
++++ b/src/layer/vulkan/shader/convolution_pack4_3x3s1d1_winograd43_fused.comp
+@@ -0,0 +1,274 @@
++// Fused winograd F(4x4,3x3) convolution for GPUs WITHOUT cooperative matrix (RDNA1/2, Apple
++// silicon via MoltenVK, ...). One dispatch per layer: the input transform, the 36 batched GEMMs
++// and the output transform all run inside a workgroup, with the transformed tiles staged in
++// shared memory, so the two ~(tiles x 36 x C) fp16 intermediates of the 3-kernel path never
++// touch VRAM (that path is VRAM-bandwidth bound: at 960x540x64 each intermediate is 149 MB and
++// is written+read once = 3 passes over >200 MB per layer).
++//
++// Fixed geometry (specialised in convolution_vulkan.cpp): pack4 in/out, pad 1, 64 output
++// channels max (any multiple of 4), input channels any multiple of 4, fp16 storage + arithmetic.
++//   workgroup  = 512 threads, 4x4 output tiles of 4x4 pixels (16x16 output pixels), all 64 oc
++//   MAC thread = (pgroup g in 0..3: 9 winograd positions) x (tile pair tp in 0..7) x (oc quad o in 0..15)
++//                -> 9 x 2 x 4 = 72 fp16 accumulators
++//   X (transformed input) chunk in LDS: [36 pos][16 tiles][16 ic] fp16, 16 input channels per chunk
++//   W (transformed weights)            : global [36 pos][C/2 ic pairs][16 oc quads][2 ic][4 oc] fp16 (16 B per (pos, ic pair, oc quad))
++//                                        (broadcast across the 4 tp lanes; hot in L0/L1/L2)
++//   Y (GEMM output) exchange in LDS    : [36 pos][16 tiles][8 oc quads] f16vec4, in two oc halves
++// Math (transform matrices, position order, weight layout) is identical to ncnn's
++// convolution_pack4_3x3s1d1_winograd43_{transform_input,gemm,transform_output} shaders, so the
++// result matches that path up to fp16 summation order.
++
++#version 450
++
++layout (constant_id = 0) const int c = 0;              // input channel quads (C/4)
++layout (constant_id = 1) const int outc = 0;           // output channel quads (64/4 = 16)
++layout (constant_id = 2) const int bias_term = 0;
++layout (constant_id = 3) const int activation_type = 0;
++layout (constant_id = 4) const float activation_param_0 = 0;
++layout (constant_id = 5) const float activation_param_1 = 0;
++
++#define shape_constant_id_offset 6
++layout (constant_id = shape_constant_id_offset + 0) const int w = 0;
++layout (constant_id = shape_constant_id_offset + 1) const int h = 0;
++layout (constant_id = shape_constant_id_offset + 2) const int cstep = 0;
++layout (constant_id = shape_constant_id_offset + 3) const int outw = 0;
++layout (constant_id = shape_constant_id_offset + 4) const int outh = 0;
++layout (constant_id = shape_constant_id_offset + 5) const int outcstep = 0;
++layout (constant_id = shape_constant_id_offset + 6) const int block_x = 0;
++layout (constant_id = shape_constant_id_offset + 7) const int block_y = 0;
++
++layout (binding = 0) readonly buffer bottom_blob { sfpvec4 bottom_blob_data[]; };
++layout (binding = 1) writeonly buffer top_blob { sfpvec4 top_blob_data[]; };
++layout (binding = 2) readonly buffer weight_blob { sfpvec4 weight_data[]; };
++layout (binding = 3) readonly buffer bias_blob { sfpvec4 bias_data[]; };
++
++layout (push_constant) uniform parameter
++{
++    int w;
++    int h;
++    int cstep;
++    int outw;
++    int outh;
++    int outcstep;
++    int block_x;
++    int block_y;
++} p;
++
++#define ICC 16                     // input channels per chunk
++#define NT 16                      // tiles per workgroup (4x4)
++#define NTHREADS 512
++
++layout (local_size_x = NTHREADS, local_size_y = 1, local_size_z = 1) in;
++
++shared afpvec2 Xs[36][NT][ICC / 2];        // transformed input chunk, ic pairs      18432 B
++shared afpvec4 Ys[36 * NT * 8];            // gemm output exchange / transform scratch 36864 B
++
++#define sq2    afp(1.41421356237)
++#define sq2_m2 afp(2.82842712474)
++#define sq2_d2 afp(0.70710678118)
++#define sq2_d4 afp(0.35355339059)
++
++void main()
++{
++    const int tid = int(gl_LocalInvocationID.x);
++    const int bx = int(gl_WorkGroupID.x);   // 4x4 tile block column
++    const int by = int(gl_WorkGroupID.y);   // 4x4 tile block row
++
++    const int C = c * 4;
++    const int OC = outc * 4;
++    const int nchunks = (C + ICC - 1) / ICC;   // partial last chunk: ic >= C reads as zero
++
++    // ---- MAC thread mapping ----
++    const int g = tid >> 7;          // position group: positions g*9 .. g*9+8
++    const int tp = (tid >> 4) & 7;   // tile pair: tiles 2tp, 2tp+1
++    const int o = tid & 15;          // oc quad
++    const bool o_valid = o < outc;   // OC < 64: idle oc-quad lanes
++
++    afpvec4 acc0[9];
++    afpvec4 acc1[9];
++    for (int i = 0; i < 9; i++) { acc0[i] = afpvec4(0.f); acc1[i] = afpvec4(0.f); }
++
++    // ---- input transform thread mapping (384 of 512 threads) ----
++    // task = (tile t in 0..15, ic quad iq in 0..3, lane j in 0..5)
++    const bool tf_active = tid < NT * 4 * 6;
++    const int tf_t = tid / 24;
++    const int tf_q = (tid / 6) & 3;
++    const int tf_j = tid - (tid / 6) * 6;
++    const int tile_x = bx * 4 + (tf_t & 3);
++    const int tile_y = by * 4 + (tf_t >> 2);
++    const bool tile_valid = tile_x < psc(block_x) && tile_y < psc(block_y);
++    const int sx = tile_x * 4 - 1 + tf_j;   // column j of the 6x6 input patch (pad 1)
++    const int sy0 = tile_y * 4 - 1;
++
++    for (int ch = 0; ch < nchunks; ch++)
++    {
++        // ---- pass 1: column j of the patch, transform along rows (vertical) ----
++        if (tf_active)
++        {
++            afpvec4 v0 = afpvec4(0.f), v1 = afpvec4(0.f), v2 = afpvec4(0.f), v3 = afpvec4(0.f), v4 = afpvec4(0.f), v5 = afpvec4(0.f);
++            if (tile_valid && sx >= 0 && sx < psc(w) && ch * 4 + tf_q < c)
++            {
++                const int base = (ch * 4 + tf_q) * psc(cstep) + sx;
++                if (sy0 + 0 >= 0 && sy0 + 0 < psc(h)) v0 = buffer_ld4(bottom_blob_data, base + (sy0 + 0) * psc(w));
++                if (sy0 + 1 >= 0 && sy0 + 1 < psc(h)) v1 = buffer_ld4(bottom_blob_data, base + (sy0 + 1) * psc(w));
++                if (sy0 + 2 >= 0 && sy0 + 2 < psc(h)) v2 = buffer_ld4(bottom_blob_data, base + (sy0 + 2) * psc(w));
++                if (sy0 + 3 >= 0 && sy0 + 3 < psc(h)) v3 = buffer_ld4(bottom_blob_data, base + (sy0 + 3) * psc(w));
++                if (sy0 + 4 >= 0 && sy0 + 4 < psc(h)) v4 = buffer_ld4(bottom_blob_data, base + (sy0 + 4) * psc(w));
++                if (sy0 + 5 >= 0 && sy0 + 5 < psc(h)) v5 = buffer_ld4(bottom_blob_data, base + (sy0 + 5) * psc(w));
++            }
++            afpvec4 m0 = v0 - v2 * afp(2.5) + v4;
++            afpvec4 m1 = v4 - v2 * afp(2) + v3 * sq2_d2 - v1 * sq2;
++            afpvec4 m2 = v4 - v2 * afp(2) - v3 * sq2_d2 + v1 * sq2;
++            afpvec4 m3 = v4 - v2 * afp(0.5) + v3 * sq2 - v1 * sq2_d2;
++            afpvec4 m4 = v4 - v2 * afp(0.5) - v3 * sq2 + v1 * sq2_d2;
++            afpvec4 m5 = v1 - v3 * afp(2.5) + v5;
++            // scratch S[t][q][k][j]
++            const int sb = ((tf_t * 4 + tf_q) * 6) * 6 + tf_j;
++            Ys[sb + 0 * 6] = m0;
++            Ys[sb + 1 * 6] = m1;
++            Ys[sb + 2 * 6] = m2;
++            Ys[sb + 3 * 6] = m3;
++            Ys[sb + 4 * 6] = m4;
++            Ys[sb + 5 * 6] = m5;
++        }
++        barrier();
++        // ---- pass 2: row k of the scratch, transform along columns (horizontal) -> X ----
++        if (tf_active)
++        {
++            const int k = tf_j;
++            const int sb = ((tf_t * 4 + tf_q) * 6 + k) * 6;
++            afpvec4 m0 = Ys[sb + 0];
++            afpvec4 m1 = Ys[sb + 1];
++            afpvec4 m2 = Ys[sb + 2];
++            afpvec4 m3 = Ys[sb + 3];
++            afpvec4 m4 = Ys[sb + 4];
++            afpvec4 m5 = Ys[sb + 5];
++            afpvec4 x0 = m0 - m2 * afp(2.5) + m4;
++            afpvec4 x1 = m4 - m2 * afp(2) + m3 * sq2_d2 - m1 * sq2;
++            afpvec4 x2 = m4 - m2 * afp(2) - m3 * sq2_d2 + m1 * sq2;
++            afpvec4 x3 = m4 - m2 * afp(0.5) + m3 * sq2 - m1 * sq2_d2;
++            afpvec4 x4 = m4 - m2 * afp(0.5) - m3 * sq2 + m1 * sq2_d2;
++            afpvec4 x5 = m1 - m3 * afp(2.5) + m5;
++            // position index = horizontal_index * 6 + vertical_index (ncnn's weight_data_tm order)
++            const int ip = tf_q * 2;   // ic pair index of this quad within the chunk
++            Xs[0 * 6 + k][tf_t][ip] = x0.rg; Xs[0 * 6 + k][tf_t][ip + 1] = x0.ba;
++            Xs[1 * 6 + k][tf_t][ip] = x1.rg; Xs[1 * 6 + k][tf_t][ip + 1] = x1.ba;
++            Xs[2 * 6 + k][tf_t][ip] = x2.rg; Xs[2 * 6 + k][tf_t][ip + 1] = x2.ba;
++            Xs[3 * 6 + k][tf_t][ip] = x3.rg; Xs[3 * 6 + k][tf_t][ip + 1] = x3.ba;
++            Xs[4 * 6 + k][tf_t][ip] = x4.rg; Xs[4 * 6 + k][tf_t][ip + 1] = x4.ba;
++            Xs[5 * 6 + k][tf_t][ip] = x5.rg; Xs[5 * 6 + k][tf_t][ip + 1] = x5.ba;
++        }
++        barrier();
++
++        // ---- MAC: acc[pp][t] += X[p][t][ic] * W[p][ic][o] over the 16 ic of this chunk ----
++        {
++            const int t0 = tp * 2;
++            const int t1 = tp * 2 + 1;
++            for (int ip = 0; ip < ICC / 2; ip++)
++            {
++                const int ic = ch * ICC + ip * 2;
++                if (ic >= C || !o_valid)
++                    continue;
++                for (int pp = 0; pp < 9; pp++)
++                {
++                    const int pos = g * 9 + pp;
++                    afpvec2 xa = Xs[pos][t0][ip];
++                    afpvec2 xb = Xs[pos][t1][ip];
++                    // W layout [pos][ic pair][oc quad][ic in pair][4 oc]: the two quads are adjacent (one 16 B load)
++                    const int wi = ((pos * (C / 2) + (ic >> 1)) * outc + o) * 2;
++                    afpvec4 w0 = buffer_ld4(weight_data, wi);
++                    afpvec4 w1 = buffer_ld4(weight_data, wi + 1);
++                    acc0[pp] += xa.r * w0 + xa.g * w1;
++                    acc1[pp] += xb.r * w0 + xb.g * w1;
++                }
++            }
++        }
++        barrier();
++    }
++
++    // ---- output transform, in two oc halves through Ys[pos][tile][oc quad (8)] ----
++    const int ot_t = tid >> 5;            // tile 0..15
++    const int ot_q = (tid >> 2) & 7;      // oc quad within the half
++    const int ot_r = tid & 3;             // output row within the 4x4 tile
++    const int otile_x = bx * 4 + (ot_t & 3);
++    const int otile_y = by * 4 + (ot_t >> 2);
++    const bool otile_valid = otile_x < psc(block_x) && otile_y < psc(block_y);
++
++    for (int hf = 0; hf < 2; hf++)
++    {
++        if (hf * 8 >= outc)
++            break;
++        if ((o >> 3) == hf && o_valid)
++        {
++            const int oq = o & 7;
++            for (int pp = 0; pp < 9; pp++)
++            {
++                const int pos = g * 9 + pp;
++                Ys[(pos * NT + tp * 2) * 8 + oq] = acc0[pp];
++                Ys[(pos * NT + tp * 2 + 1) * 8 + oq] = acc1[pp];
++            }
++        }
++        barrier();
++        {
++            // row r of A^T M: needs v[i][j] for i = 0..5 (vertical), j = 0..5
++            afpvec4 mr[6];
++            for (int j = 0; j < 6; j++)
++            {
++                const int yb = ot_t * 8 + ot_q;
++                // v_i = value at (horizontal j, vertical i) = position j*6 + i
++                afpvec4 v0 = Ys[(j * 6 + 0) * NT * 8 + yb];
++                afpvec4 v1 = Ys[(j * 6 + 1) * NT * 8 + yb];
++                afpvec4 v2 = Ys[(j * 6 + 2) * NT * 8 + yb];
++                afpvec4 v3 = Ys[(j * 6 + 3) * NT * 8 + yb];
++                afpvec4 v4 = Ys[(j * 6 + 4) * NT * 8 + yb];
++                afpvec4 v5 = Ys[(j * 6 + 5) * NT * 8 + yb];
++                if (ot_r == 0) mr[j] = v0 + v1 + v2 + v3 + v4;
++                else if (ot_r == 1) mr[j] = (v1 - v2) * sq2_d2 + (v3 - v4) * sq2;
++                else if (ot_r == 2) mr[j] = (v1 + v2) * afp(0.5) + (v3 + v4) * afp(2);
++                else mr[j] = v5 + (v1 - v2) * sq2_d4 + (v3 - v4) * sq2_m2;
++            }
++            afpvec4 out0 = mr[0] + mr[1] + mr[2] + mr[3] + mr[4];
++            afpvec4 out1 = (mr[1] - mr[2]) * sq2_d2 + (mr[3] - mr[4]) * sq2;
++            afpvec4 out2 = (mr[1] + mr[2]) * afp(0.5) + (mr[3] + mr[4]) * afp(2);
++            afpvec4 out3 = mr[5] + (mr[1] - mr[2]) * sq2_d4 + (mr[3] - mr[4]) * sq2_m2;
++
++            const int ocq = hf * 8 + ot_q;
++            const bool ocq_valid = ocq < outc;
++            if (bias_term == 1 && ocq_valid)
++            {
++                afpvec4 b = buffer_ld4(bias_data, ocq);
++                out0 += b; out1 += b; out2 += b; out3 += b;
++            }
++            if (activation_type == 1)
++            {
++                out0 = max(out0, afp(0.f)); out1 = max(out1, afp(0.f)); out2 = max(out2, afp(0.f)); out3 = max(out3, afp(0.f));
++            }
++            if (activation_type == 2)
++            {
++                const afp slope = afp(activation_param_0);
++                out0 = max(out0, afp(0.f)) + min(out0, afp(0.f)) * slope;
++                out1 = max(out1, afp(0.f)) + min(out1, afp(0.f)) * slope;
++                out2 = max(out2, afp(0.f)) + min(out2, afp(0.f)) * slope;
++                out3 = max(out3, afp(0.f)) + min(out3, afp(0.f)) * slope;
++            }
++            if (activation_type == 3)
++            {
++                const afp cmin = afp(activation_param_0);
++                const afp cmax = afp(activation_param_1);
++                out0 = clamp(out0, cmin, cmax); out1 = clamp(out1, cmin, cmax); out2 = clamp(out2, cmin, cmax); out3 = clamp(out3, cmin, cmax);
++            }
++
++            const int ox = otile_x * 4;
++            const int oy = otile_y * 4 + ot_r;
++            if (otile_valid && ocq_valid && oy < psc(outh))
++            {
++                const int gi = ocq * psc(outcstep) + oy * psc(outw) + ox;
++                buffer_st4(top_blob_data, gi + 0, out0);
++                if (ox + 1 < psc(outw)) buffer_st4(top_blob_data, gi + 1, out1);
++                if (ox + 2 < psc(outw)) buffer_st4(top_blob_data, gi + 2, out2);
++                if (ox + 3 < psc(outw)) buffer_st4(top_blob_data, gi + 3, out3);
++            }
++        }
++        barrier();
++    }
++}
+diff --git a/src/layer/vulkan/shader/gridsample.comp b/src/layer/vulkan/shader/gridsample.comp
+new file mode 100644
+index 0000000..172fb37
+--- /dev/null
++++ b/src/layer/vulkan/shader/gridsample.comp
+@@ -0,0 +1,183 @@
++// Copyright 2026 Tencent
++// SPDX-License-Identifier: BSD-3-Clause
++//
++// Vulkan compute GridSample (3D image case), buffer storage, elempack=1.
++// Mirrors src/layer/gridsample.cpp semantics exactly (bilinear/nearest/bicubic,
++// zeros/border/reflection padding, align_corner, permute_fusion grid layout).
++
++#version 450
++
++layout (constant_id = 0) const int sample_type = 1;    // 1=bilinear 2=nearest 3=bicubic
++layout (constant_id = 1) const int padding_mode = 1;   // 1=zeros 2=border 3=reflection
++layout (constant_id = 2) const int align_corner = 0;   // 0/1
++layout (constant_id = 3) const int permute_fusion = 0; // 0/1
++
++#define shape_constant_id_offset 4
++layout (constant_id = shape_constant_id_offset + 0) const int w = 0;        // input w
++layout (constant_id = shape_constant_id_offset + 1) const int h = 0;        // input h
++layout (constant_id = shape_constant_id_offset + 2) const int c = 0;        // input/out channels
++layout (constant_id = shape_constant_id_offset + 3) const int cstep = 0;    // input cstep
++layout (constant_id = shape_constant_id_offset + 4) const int gw = 0;       // grid w   (permute_fusion=1)
++layout (constant_id = shape_constant_id_offset + 5) const int gcstep = 0;   // grid cstep
++layout (constant_id = shape_constant_id_offset + 6) const int outw = 0;
++layout (constant_id = shape_constant_id_offset + 7) const int outh = 0;
++layout (constant_id = shape_constant_id_offset + 8) const int outcstep = 0;
++
++layout (binding = 0) readonly buffer bottom_blob { sfp bottom_blob_data[]; };
++layout (binding = 1) readonly buffer grid_blob { sfp grid_blob_data[]; };
++layout (binding = 2) writeonly buffer top_blob { sfp top_blob_data[]; };
++
++layout (push_constant) uniform parameter
++{
++    int w;
++    int h;
++    int c;
++    int cstep;
++    int gw;
++    int gcstep;
++    int outw;
++    int outh;
++    int outcstep;
++} p;
++
++float unormalize(int size, float coord)
++{
++    if (align_corner == 1)
++        return (coord + 1.0) / 2.0 * float(size - 1);
++    return ((coord + 1.0) * float(size) - 1.0) / 2.0;
++}
++
++float reflect_coord(float x, int high)
++{
++    float fh = float(high);
++    x = abs(x);
++    x = fh - abs(x - fh);
++    return x;
++}
++
++float compute_coord(float sx, int size)
++{
++    if (padding_mode == 2) // border
++    {
++        sx = min(float(size - 1), max(sx, 0.0));
++    }
++    else if (padding_mode == 3) // reflection
++    {
++        if (align_corner == 1)
++        {
++            sx = reflect_coord(sx, size - 1);
++        }
++        else
++        {
++            sx = reflect_coord(sx + 0.5, size) - 0.5;
++            sx = min(float(size - 1), max(sx, 0.0));
++        }
++    }
++    return sx;
++}
++
++// value at integer (x,y) of channel ch, 0 if out of the real image bounds
++float get_bounded(int x, int y, int ch)
++{
++    if (x < 0 || y < 0 || x >= psc(w) || y >= psc(h))
++        return 0.0;
++    return float(buffer_ld1(bottom_blob_data, ch * psc(cstep) + y * psc(w) + x));
++}
++
++// value with per-tap coordinate padding applied (bicubic path)
++float get_padded(int x, int y, int ch)
++{
++    int xc = int(compute_coord(float(x), psc(w)));
++    int yc = int(compute_coord(float(y), psc(h)));
++    return get_bounded(xc, yc, ch);
++}
++
++void cubic_coeffs(float fx, out float c0, out float c1, out float c2, out float c3)
++{
++    const float A = -0.75;
++    float fx0 = fx + 1.0;
++    float fx1 = fx;
++    float fx2 = 1.0 - fx;
++    c0 = A * fx0 * fx0 * fx0 - 5.0 * A * fx0 * fx0 + 8.0 * A * fx0 - 4.0 * A;
++    c1 = (A + 2.0) * fx1 * fx1 * fx1 - (A + 3.0) * fx1 * fx1 + 1.0;
++    c2 = (A + 2.0) * fx2 * fx2 * fx2 - (A + 3.0) * fx2 * fx2 + 1.0;
++    c3 = 1.0 - c0 - c1 - c2;
++}
++
++void main()
++{
++    int gx = int(gl_GlobalInvocationID.x);
++    int gy = int(gl_GlobalInvocationID.y);
++    int gz = int(gl_GlobalInvocationID.z);
++
++    if (gx >= psc(outw) || gy >= psc(outh) || gz >= psc(c))
++        return;
++
++    // read normalized grid coords at this output location
++    float sample_x;
++    float sample_y;
++    if (permute_fusion == 0)
++    {
++        // grid laid out [c=outh, h=outw, w=2] interleaved
++        int base = gy * psc(gcstep) + gx * 2;
++        sample_x = float(buffer_ld1(grid_blob_data, base + 0));
++        sample_y = float(buffer_ld1(grid_blob_data, base + 1));
++    }
++    else
++    {
++        // grid laid out [c=2, h=outh, w=outw]
++        int idx = gy * psc(gw) + gx;
++        sample_x = float(buffer_ld1(grid_blob_data, idx));
++        sample_y = float(buffer_ld1(grid_blob_data, psc(gcstep) + idx));
++    }
++
++    sample_x = unormalize(psc(w), sample_x);
++    sample_y = unormalize(psc(h), sample_y);
++
++    float v = 0.0;
++
++    if (sample_type == 1) // bilinear
++    {
++        sample_x = compute_coord(sample_x, psc(w));
++        sample_y = compute_coord(sample_y, psc(h));
++        int x0 = int(floor(sample_x));
++        int y0 = int(floor(sample_y));
++        float a = sample_x - float(x0);
++        float b = sample_y - float(y0);
++        float v00 = get_bounded(x0, y0, gz);
++        float v01 = get_bounded(x0 + 1, y0, gz);
++        float v10 = get_bounded(x0, y0 + 1, gz);
++        float v11 = get_bounded(x0 + 1, y0 + 1, gz);
++        float v0 = v00 * (1.0 - a) + v01 * a;
++        float v1 = v10 * (1.0 - a) + v11 * a;
++        v = v0 * (1.0 - b) + v1 * b;
++    }
++    else if (sample_type == 2) // nearest
++    {
++        sample_x = compute_coord(sample_x, psc(w));
++        sample_y = compute_coord(sample_y, psc(h));
++        int x0 = int(floor(sample_x + 0.5));
++        int y0 = int(floor(sample_y + 0.5));
++        v = get_bounded(x0, y0, gz);
++    }
++    else // bicubic
++    {
++        int x1 = int(floor(sample_x));
++        int y1 = int(floor(sample_y));
++        float xc[4];
++        float yc[4];
++        cubic_coeffs(sample_x - float(x1), xc[0], xc[1], xc[2], xc[3]);
++        cubic_coeffs(sample_y - float(y1), yc[0], yc[1], yc[2], yc[3]);
++        for (int j = 0; j < 4; j++)
++        {
++            float row = 0.0;
++            row += get_padded(x1 - 1, y1 - 1 + j, gz) * xc[0];
++            row += get_padded(x1 + 0, y1 - 1 + j, gz) * xc[1];
++            row += get_padded(x1 + 1, y1 - 1 + j, gz) * xc[2];
++            row += get_padded(x1 + 2, y1 - 1 + j, gz) * xc[3];
++            v += row * yc[j];
++        }
++    }
++
++    buffer_st1(top_blob_data, gz * psc(outcstep) + gy * psc(outw) + gx, afp(v));
++}
+diff --git a/src/layer/vulkan/shader/spabtail_pack4.comp b/src/layer/vulkan/shader/spabtail_pack4.comp
+new file mode 100644
+index 0000000..5028f4e
+--- /dev/null
++++ b/src/layer/vulkan/shader/spabtail_pack4.comp
+@@ -0,0 +1,74 @@
++// SPDX-License-Identifier: BSD-3-Clause
++// SpabTail: out = (res + x) * tanh(W * x + b), one thread per pixel, all channels in registers.
++// W is read with a wave-uniform index (scalar cache), x quads are loaded once and reused for the
++// residual multiply, so VRAM traffic is exactly read res + read x + write out.
++
++#version 450
++
++layout (constant_id = 0) const int c = 0;        // input channel quads
++layout (constant_id = 1) const int outc = 0;     // output channel quads
++layout (constant_id = 2) const int bias_term = 0;
++
++#define shape_constant_id_offset 3
++layout (constant_id = shape_constant_id_offset + 0) const int w = 0;
++layout (constant_id = shape_constant_id_offset + 1) const int h = 0;
++layout (constant_id = shape_constant_id_offset + 2) const int cstep = 0;
++layout (constant_id = shape_constant_id_offset + 3) const int outw = 0;
++layout (constant_id = shape_constant_id_offset + 4) const int outh = 0;
++layout (constant_id = shape_constant_id_offset + 5) const int outcstep = 0;
++
++layout (binding = 0) readonly buffer res_blob { sfpvec4 res_blob_data[]; };
++layout (binding = 1) readonly buffer x_blob { sfpvec4 x_blob_data[]; };
++layout (binding = 2) writeonly buffer top_blob { sfpvec4 top_blob_data[]; };
++layout (binding = 3) readonly buffer weight_blob { sfpvec4 weight_data[]; };
++layout (binding = 4) readonly buffer bias_blob { sfpvec4 bias_data[]; };
++
++layout (push_constant) uniform parameter
++{
++    int w;
++    int h;
++    int cstep;
++    int outw;
++    int outh;
++    int outcstep;
++} p;
++
++void main()
++{
++    int gx = int(gl_GlobalInvocationID.x);
++    int gy = int(gl_GlobalInvocationID.y);
++
++    if (gx >= psc(w) || gy >= psc(h))
++        return;
++
++    const int pix = gy * psc(w) + gx;
++
++    afpvec4 xv[16];
++    for (int q = 0; q < c; q++)
++        xv[q] = buffer_ld4(x_blob_data, q * psc(cstep) + pix);
++
++    afpvec4 acc[16];
++    for (int r = 0; r < outc; r++)
++        acc[r] = bias_term == 1 ? buffer_ld4(bias_data, r) : afpvec4(0.f);
++
++    for (int q = 0; q < c; q++)
++    {
++        const afpvec4 xq = xv[q];
++        for (int r = 0; r < outc; r++)
++        {
++            const int wi = (q * 4) * outc + r;
++            acc[r] += xq.r * buffer_ld4(weight_data, wi)
++                    + xq.g * buffer_ld4(weight_data, wi + outc)
++                    + xq.b * buffer_ld4(weight_data, wi + 2 * outc)
++                    + xq.a * buffer_ld4(weight_data, wi + 3 * outc);
++        }
++    }
++
++    for (int r = 0; r < outc; r++)
++    {
++        afpvec4 t = tanh(acc[r]);
++        afpvec4 rv = buffer_ld4(res_blob_data, r * psc(cstep) + pix);
++        afpvec4 o = (rv + xv[r]) * t;
++        buffer_st4(top_blob_data, r * psc(outcstep) + pix, o);
++    }
++}
+diff --git a/src/layer/vulkan/spabtail_vulkan.cpp b/src/layer/vulkan/spabtail_vulkan.cpp
+new file mode 100644
+index 0000000..654257b
+--- /dev/null
++++ b/src/layer/vulkan/spabtail_vulkan.cpp
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "spabtail_vulkan.h"
++
++#include "layer_shader_type.h"
++
++namespace ncnn {
++
++SpabTail_vulkan::SpabTail_vulkan()
++{
++    support_vulkan = true;
++    support_vulkan_packing = true;
++
++    pipeline_spabtail_pack4 = 0;
++}
++
++int SpabTail_vulkan::create_pipeline(const Option& opt)
++{
++    if (num_input % 4 != 0 || num_output % 4 != 0 || num_input > 64 || num_output > 64)
++    {
++        NCNN_LOGE("SpabTail_vulkan: unsupported channel counts %d -> %d (need multiples of 4, <= 64)", num_input, num_output);
++        return -1;
++    }
++
++    // [ic quad][ic in quad][oc]: the shader reads one f16vec4 (4 oc) per (ic, oc quad), uniform index
++    weight_data_packed.create(num_input * num_output);
++    {
++        float* dst = weight_data_packed;
++        for (int q = 0; q < num_input / 4; q++)
++            for (int j = 0; j < 4; j++)
++                for (int o = 0; o < num_output; o++)
++                    *dst++ = ((const float*)weight_data)[o * num_input + q * 4 + j];
++    }
++
++    std::vector<vk_specialization_type> specializations(3 + 6);
++    specializations[0].i = num_input / 4;
++    specializations[1].i = num_output / 4;
++    specializations[2].i = bias_term;
++    for (int i = 0; i < 6; i++) specializations[3 + i].i = 0;
++
++    pipeline_spabtail_pack4 = new Pipeline(vkdev);
++    pipeline_spabtail_pack4->set_local_size_xyz(64, 1, 1);
++    pipeline_spabtail_pack4->create(LayerShaderType::spabtail_pack4, opt, specializations);
++
++    return 0;
++}
++
++int SpabTail_vulkan::destroy_pipeline(const Option& /*opt*/)
++{
++    delete pipeline_spabtail_pack4;
++    pipeline_spabtail_pack4 = 0;
++    return 0;
++}
++
++int SpabTail_vulkan::upload_model(VkTransfer& cmd, const Option& opt)
++{
++    cmd.record_upload(weight_data_packed, weight_data_gpu, opt);
++    weight_data_packed.release();
++
++    if (bias_term)
++    {
++        cmd.record_upload(bias_data, bias_data_gpu, opt);
++        bias_data.release();
++    }
++
++    return 0;
++}
++
++int SpabTail_vulkan::forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkMat>& top_blobs, VkCompute& cmd, const Option& opt) const
++{
++    const VkMat& res = bottom_blobs[0];
++    const VkMat& x = bottom_blobs[1];
++    if (x.dims != 3 || x.elempack != 4 || res.elempack != 4 || x.c * 4 != num_input || res.c * 4 != num_output || res.w != x.w || res.h != x.h || res.cstep != x.cstep)
++    {
++        NCNN_LOGE("SpabTail_vulkan: unsupported blob layout (dims %d elempack %d/%d c %d/%d)", x.dims, x.elempack, res.elempack, x.c, res.c);
++        return -1;
++    }
++
++    VkMat& top_blob = top_blobs[0];
++    top_blob.create_like(res, opt.blob_vkallocator);
++    if (top_blob.empty())
++        return -100;
++
++    std::vector<VkMat> bindings(5);
++    bindings[0] = res;
++    bindings[1] = x;
++    bindings[2] = top_blob;
++    bindings[3] = weight_data_gpu;
++    bindings[4] = bias_data_gpu;
++
++    std::vector<vk_constant_type> constants(6);
++    constants[0].i = x.w;
++    constants[1].i = x.h;
++    constants[2].i = x.cstep;
++    constants[3].i = top_blob.w;
++    constants[4].i = top_blob.h;
++    constants[5].i = top_blob.cstep;
++
++    VkMat dispatcher;
++    dispatcher.w = x.w;
++    dispatcher.h = x.h;
++    dispatcher.c = 1;
++
++    cmd.record_pipeline(pipeline_spabtail_pack4, bindings, constants, dispatcher);
++
++    return 0;
++}
++
++} // namespace ncnn
+diff --git a/src/layer/vulkan/spabtail_vulkan.h b/src/layer/vulkan/spabtail_vulkan.h
+new file mode 100644
+index 0000000..467b9bf
+--- /dev/null
++++ b/src/layer/vulkan/spabtail_vulkan.h
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: BSD-3-Clause
++
++#ifndef LAYER_SPABTAIL_VULKAN_H
++#define LAYER_SPABTAIL_VULKAN_H
++
++#include "spabtail.h"
++
++namespace ncnn {
++
++class SpabTail_vulkan : public SpabTail
++{
++public:
++    SpabTail_vulkan();
++
++    virtual int create_pipeline(const Option& opt);
++    virtual int destroy_pipeline(const Option& opt);
++
++    virtual int upload_model(VkTransfer& cmd, const Option& opt);
++
++    using SpabTail::forward;
++    virtual int forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkMat>& top_blobs, VkCompute& cmd, const Option& opt) const;
++
++public:
++    Mat weight_data_packed;    // [ic quad][ic in quad][oc] fp32 -> uploaded (fp16, elempack 4 over oc)
++    VkMat weight_data_gpu;
++    VkMat bias_data_gpu;
++
++    Pipeline* pipeline_spabtail_pack4;
++};
++
++} // namespace ncnn
++
++#endif // LAYER_SPABTAIL_VULKAN_H
+diff --git a/src/net.cpp b/src/net.cpp
+index b1a4842..26cada9 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -15,6 +15,7 @@
+ 
+ #if NCNN_BENCHMARK
+ #include "benchmark.h"
++#include <stdlib.h>
+ #endif // NCNN_BENCHMARK
+ 
+ #if NCNN_VULKAN
+@@ -267,9 +268,16 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
+     {
+         pending_dispatch_threshold = 256 * 1024; // 256K
+     }
++    // NCNN_DISPATCH_THRESHOLD env overrides the rough-score default (0 = keep default)
++    static const uint32_t env_dispatch_threshold = getenv("NCNN_DISPATCH_THRESHOLD") ? (uint32_t)strtoul(getenv("NCNN_DISPATCH_THRESHOLD"), 0, 10) : 0;
++    if (env_dispatch_threshold)
++        pending_dispatch_threshold = env_dispatch_threshold;
+     if (cmd.pending_dispatch_total() > pending_dispatch_threshold)
+     {
+         cmd_submit_and_wait = true;
++#if NCNN_BENCHMARK
++        NCNN_LOGE("[ncnn midflush before layer %d %s pending=%llu thr=%u]", layer_index, layer->name.c_str(), (unsigned long long)cmd.pending_dispatch_total(), pending_dispatch_threshold);
++#endif
+     }
+ 
+     int ret;
+-- 
+2.55.0
+

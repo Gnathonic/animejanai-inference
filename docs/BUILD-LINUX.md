@@ -108,7 +108,9 @@ exit.
 
 ### `aji_vk` (ncnn-Vulkan)
 
-ncnn **must be built from source with Vulkan enabled** (`-DNCNN_VULKAN=ON`); the pip wheel
+ncnn **must be built from source with Vulkan enabled** (`-DNCNN_VULKAN=ON`) **with the
+`tools/ncnn_patch/` patch applied** (GridSample Vulkan layer for RIFE, the fused winograd43
+convolution and the SpabTail layer the shipped `.param` files use — see `tools/ncnn_patch/README.md`); the pip wheel
 and a stock package do not work here, and GPU RIFE additionally needs the `gridsample_vulkan`
 layer from the ncnn tree this branch was developed against. Point CMake at the ncnn source
 tree — it looks for `libncnn.so` in `<root>/build/src`, `<root>/build-fast/src` or

@@ -10,7 +10,9 @@
  *   aji_host_harness --lib <libaji> --conf animejanai.conf --model-dir DIR [--slot N]
  *                    --input in.raw --width W --height H [--format nv12|p010]
  *                    [--matrix 601|709|2020] [--range limited|full] [--fps F]
- *                    [--frames N] [--output out.raw] [--rife-dir DIR]
+ *                    [--frames N] [--inflight N] [--output out.raw] [--rife-dir DIR]
+ *   --inflight N keeps N frames submitted before waiting the oldest (the player pipelines
+ *   this way; default 1 = one frame at a time, a throughput lower bound).
  *
  *   ffmpeg -i clip.mkv -frames:v 24 -pix_fmt nv12 -f rawvideo in.raw
  *
@@ -32,7 +34,7 @@ static void log_cb(void *o, int level, const char *m) { (void)o; fprintf(stderr,
 int main(int argc, char **argv)
 {
     const char *libpath = NULL, *conf = NULL, *model_dir = NULL, *rife_dir = NULL, *input = NULL, *output = NULL;
-    int w = 0, h = 0, slot = 1002, frames = 0, format = AJI_FMT_NV12, matrix = AJI_MATRIX_BT709, range = AJI_RANGE_LIMITED;
+    int w = 0, h = 0, slot = 1002, frames = 0, inflight = 1, format = AJI_FMT_NV12, matrix = AJI_MATRIX_BT709, range = AJI_RANGE_LIMITED;
     double fps = 23.976;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : "";
@@ -41,7 +43,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--input")) input = v; else if (!strcmp(a, "--output")) output = v;
         else if (!strcmp(a, "--width")) w = atoi(v); else if (!strcmp(a, "--height")) h = atoi(v);
         else if (!strcmp(a, "--slot")) slot = atoi(v); else if (!strcmp(a, "--frames")) frames = atoi(v);
-        else if (!strcmp(a, "--fps")) fps = atof(v);
+        else if (!strcmp(a, "--fps")) fps = atof(v); else if (!strcmp(a, "--inflight")) inflight = atoi(v) > 1 ? atoi(v) : 1;
         else if (!strcmp(a, "--format")) format = !strcmp(v, "p010") ? AJI_FMT_P010 : AJI_FMT_NV12;
         else if (!strcmp(a, "--matrix")) matrix = !strcmp(v, "601") ? AJI_MATRIX_BT601 : !strcmp(v, "2020") ? AJI_MATRIX_BT2020 : AJI_MATRIX_BT709;
         else if (!strcmp(a, "--range")) range = !strcmp(v, "full") ? AJI_RANGE_FULL : AJI_RANGE_LIMITED;
@@ -79,26 +81,37 @@ int main(int argc, char **argv)
     const int bps = format == AJI_FMT_P010 ? 2 : 1;
     const size_t in_y = (size_t)w * h * bps, in_uv = (size_t)w * (h / 2) * bps;
     const size_t out_y = (size_t)ow * oh * bps, out_uv = (size_t)ow * (oh / 2) * bps;
-    unsigned char *ib = malloc(in_y + in_uv), *ob = malloc(out_y + out_uv);
     FILE *fi = fopen(input, "rb"), *fo = output ? fopen(output, "wb") : NULL;
     if (!fi) { perror(input); return 2; }
-    aji_frame in = { w, h, format, matrix, range, AJI_SITING_LEFT, { ib, ib + in_y, NULL }, { w * bps, w * bps, 0 } };
-    aji_frame out = { ow, oh, format, matrix, range, AJI_SITING_LEFT, { ob, ob + out_y, NULL }, { ow * bps, ow * bps, 0 } };
-    int n = 0; double total = 0, first = 0;
-    while ((!frames || n < frames) && fread(ib, 1, in_y + in_uv, fi) == in_y + in_uv) {
-        double t0 = now_ms();
+    /* ring of in-flight frames: each keeps its own in/out planes until its ticket is waited */
+    unsigned char **ib = malloc(sizeof *ib * inflight), **ob = malloc(sizeof *ob * inflight);
+    uint64_t *tk = calloc(inflight, sizeof *tk);
+    for (int i = 0; i < inflight; i++) { ib[i] = malloc(in_y + in_uv); ob[i] = malloc(out_y + out_uv); }
+    int n = 0, done = 0; double total = 0, first = 0, t_first_done = 0, t_start = 0;
+    #define WAIT_SLOT(i) do { \
+        r = aji_wait_f(c, tk[i]); \
+        if (r < 0) { fprintf(stderr, "aji_wait frame %d: %d %s\n", done, r, aji_last_error_f(c)); return 1; } \
+        tk[i] = 0; if (fo) fwrite(ob[i], 1, out_y + out_uv, fo); \
+        if (done == 0) { first = now_ms() - t_start; t_first_done = now_ms(); } \
+        done++; } while (0)
+    for (;;) {
+        int i = n % inflight;
+        if (tk[i]) WAIT_SLOT(i);
+        if ((frames && n >= frames) || fread(ib[i], 1, in_y + in_uv, fi) != in_y + in_uv) break;
+        aji_frame in = { w, h, format, matrix, range, AJI_SITING_LEFT, { ib[i], ib[i] + in_y, NULL }, { w * bps, w * bps, 0 } };
+        aji_frame out = { ow, oh, format, matrix, range, AJI_SITING_LEFT, { ob[i], ob[i] + out_y, NULL }, { ow * bps, ow * bps, 0 } };
+        if (n == 0) t_start = now_ms();
         r = aji_infer_f(c, &in, &out, NULL);
         if (r < 0) { fprintf(stderr, "aji_infer frame %d: %d %s\n", n, r, aji_last_error_f(c)); return 1; }
-        r = aji_wait_f(c, aji_flush_f(c, NULL));
-        if (r < 0) { fprintf(stderr, "aji_wait frame %d: %d %s\n", n, r, aji_last_error_f(c)); return 1; }
-        double dt = now_ms() - t0;
-        if (n == 0) first = dt; else total += dt;
-        if (fo) fwrite(ob, 1, out_y + out_uv, fo);
+        tk[i] = aji_flush_f(c, NULL);
+        if (!tk[i]) tk[i] = 1;   /* sync engines return a constant; still mark the slot pending */
         n++;
     }
+    for (int k = 0; k < inflight; k++) { int i = (n + k) % inflight; if (tk[i]) WAIT_SLOT(i); }
     if (fo) fclose(fo);
-    printf("frames: %d  first: %.1f ms  mean(sync, after first): %.2f ms/frame  (%.1f fps lower bound)\n",
-           n, first, n > 1 ? total / (n - 1) : 0, n > 1 ? 1000.0 * (n - 1) / total : 0);
+    total = now_ms() - t_first_done;
+    printf("frames: %d  first: %.1f ms  mean(inflight %d, after first): %.2f ms/frame  (%.1f fps)\n",
+           n, first, inflight, n > 1 ? total / (n - 1) : 0, n > 1 ? 1000.0 * (n - 1) / total : 0);
     aji_destroy_f(&c);
     return n > 0 ? 0 : 1;
 }
