@@ -1,0 +1,288 @@
+From 6a6f8d972d2e1b5a7bb99254f35558ed54ddad47 Mon Sep 17 00:00:00 2001
+From: Nathan Rogers <gnathonic@gmail.com>
+Date: Tue, 15 Sep 2026 15:36:44 -0700
+Subject: [PATCH 3/3] fused winograd43: 32 KB shared-memory config (Apple
+ limit; also faster on RDNA2), Apple keeps the stock path
+
+- WINO_ICC/WINO_OCH #defines pick (16,8)=55 KB or (8,4)=27.6 KB; compiled from the embedded
+  source via the new get_layer_shader_source(); the small config is the default where
+  maxComputeSharedMemorySize is 32 KB and on GPUs without cooperative matrix (RX 6900 XT
+  1.01 -> 0.88 ms). NCNN_WINO_LDS=32|64 overrides. Pipeline-creation failure falls back to
+  the 3-kernel path instead of crashing.
+- Apple/MoltenVK runs the fused kernel ~30% slower than stock ncnn (M2 Pro), so vendor 0x106B
+  keeps the stock path unless NCNN_WINO_FUSED=2.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/gpu.cpp                                   |  9 +++
+ src/gpu.h                                     |  2 +
+ src/layer/vulkan/convolution_vulkan.cpp       | 51 +++++++++++--
+ ...lution_pack4_3x3s1d1_winograd43_fused.comp | 76 +++++++++++--------
+ 4 files changed, 100 insertions(+), 38 deletions(-)
+
+diff --git a/src/gpu.cpp b/src/gpu.cpp
+index dfae279..f769288 100644
+--- a/src/gpu.cpp
++++ b/src/gpu.cpp
+@@ -113,6 +113,15 @@ static uint64_t fnv1a_64_update(uint64_t h, const unsigned char* data, int size)
+     return h;
+ }
+ 
++std::string get_layer_shader_source(int shader_type_index)
++{
++    if (shader_type_index < 0 || shader_type_index >= layer_shader_registry_entry_count)
++        return std::string();
++
++    const layer_shader_registry_entry& entry = layer_shader_registry[shader_type_index];
++    return std::string(entry.comp_data, entry.comp_data_size);
++}
++
+ uint64_t get_shader_source_hash(int shader_type_index)
+ {
+     if (shader_type_index < 0 || shader_type_index >= layer_shader_registry_entry_count)
+diff --git a/src/gpu.h b/src/gpu.h
+index 78f3155..795d5a5 100644
+--- a/src/gpu.h
++++ b/src/gpu.h
+@@ -560,6 +560,8 @@ private:
+ NCNN_EXPORT VulkanDevice* get_gpu_device(int device_index = get_default_gpu_index());
+ 
+ // online spirv compilation
++// the embedded GLSL source of a built-in layer shader (to compile a variant with extra #defines)
++NCNN_EXPORT std::string get_layer_shader_source(int shader_type_index);
+ NCNN_EXPORT int compile_spirv_module(const char* comp_string, const Option& opt, std::vector<uint32_t>& spirv);
+ NCNN_EXPORT int compile_spirv_module(const char* comp_data, int comp_data_size, const Option& opt, std::vector<uint32_t>& spirv);
+ NCNN_EXPORT int compile_spirv_module(int shader_type_index, const Option& opt, std::vector<uint32_t>& spirv);
+diff --git a/src/layer/vulkan/convolution_vulkan.cpp b/src/layer/vulkan/convolution_vulkan.cpp
+index 50e1419..dfe5cb1 100644
+--- a/src/layer/vulkan/convolution_vulkan.cpp
++++ b/src/layer/vulkan/convolution_vulkan.cpp
+@@ -206,11 +206,13 @@ int Convolution_vulkan::create_pipeline(const Option& opt)
+         const bool env_ok = !(env && env[0] == '0');
+         const bool env_force = env && env[0] == '2';
+         const bool cm = vkdev->info.support_cooperative_matrix() && opt.use_cooperative_matrix && (opt.use_fp16_storage || opt.use_fp16_packed);
+-        // measured faster than ncnn's coopmat winograd on every GPU tried (RX 9070 XT 1.33 vs 1.97 ms,
+-        // RTX 4090 0.56 vs 0.93 ms), so it is the default everywhere; NCNN_WINO_FUSED=0 reverts.
++        // measured faster than ncnn's coopmat winograd on every desktop GPU tried (RX 9070 XT 1.33 vs
++        // 1.97 ms, RTX 4090 0.56 vs 0.93 ms, RX 6900 XT 0.88 vs 2.75 ms), so it is the default there;
++        // NCNN_WINO_FUSED=0 reverts. Apple GPUs (MoltenVK) run it SLOWER than ncnn's stock path
++        // (M2 Pro: -30%), so they keep the stock path unless NCNN_WINO_FUSED=2 forces it.
+         // Narrow inputs (< 16 ch) stay on the coopmat gemm where one exists (faster and exact there).
+-        (void)env_force;
+-        use_winograd43_fused = env_ok && (num_input >= 16 || !cm)
++        const bool apple = vkdev->info.vendor_id() == 0x106B;
++        use_winograd43_fused = env_ok && (!apple || env_force) && (num_input >= 16 || !cm)
+                                && opt.use_winograd_convolution && opt.use_winograd43_convolution && is_conv3x3s1d1
+                                && elempack == 4 && out_elempack == 4 && num_output <= 64
+                                && pad_left == 1 && pad_right == 1 && pad_top == 1 && pad_bottom == 1
+@@ -609,9 +611,44 @@ int Convolution_vulkan::create_pipeline(const Option& opt)
+                 }
+                 for (int i = 0; i < 8; i++) specializations[7 + i].i = 0;   // shapes via push constants
+ 
+-                pipeline_convolution_3x3s1d1_winograd43_fused = new Pipeline(vkdev);
+-                pipeline_convolution_3x3s1d1_winograd43_fused->set_local_size_xyz(512, 1, 1);
+-                pipeline_convolution_3x3s1d1_winograd43_fused->create(LayerShaderType::convolution_pack4_3x3s1d1_winograd43_fused, opt, specializations);
++                // shared-memory config: (16 ic per chunk, 8 oc quads per output pass) = 55 KB, or
++                // (8, 4) = 27.6 KB. The small one is required where maxComputeSharedMemorySize is 32 KB
++                // (Apple/MoltenVK) and is also faster on GPUs without cooperative matrix (RX 6900 XT
++                // 1.01 -> 0.89 ms: twice the workgroups per WGP); coopmat-class GPUs prefer the large
++                // one (RX 9070 XT 1.35 vs 1.66 ms). NCNN_WINO_LDS=32|64 overrides.
++                const uint32_t lds_max = vkdev->info.max_shared_memory_size();
++                const char* lds_env = getenv("NCNN_WINO_LDS");
++                bool small_lds = lds_max < 36u * 16u * 16u * 2u + 36u * 16u * 8u * 8u || !vkdev->info.support_cooperative_matrix();
++                if (lds_env && lds_env[0] == '3') small_lds = true;
++                if (lds_env && lds_env[0] == '6' && lds_max >= 36u * 16u * 16u * 2u + 36u * 16u * 8u * 8u) small_lds = false;
++                int ret = -1;
++                if (lds_max >= 36u * 16u * 8u * 2u + 36u * 16u * 4u * 8u && vkdev->info.max_workgroup_invocations() >= 512)
++                {
++                    // the .comp defaults to the large config; the small one is selected by #defines
++                    // injected after the #version line (ncnn's option defines go in via the preamble)
++                    std::string src = ncnn::get_layer_shader_source(LayerShaderType::convolution_pack4_3x3s1d1_winograd43_fused);
++                    if (small_lds)
++                    {
++                        size_t nl = src.find('\n');
++                        if (nl != std::string::npos)
++                            src.insert(nl + 1, "#define WINO_ICC 8\n#define WINO_OCH 4\n");
++                    }
++                    std::vector<uint32_t> spirv;
++                    if (compile_spirv_module(src.c_str(), (int)src.size(), opt, spirv) == 0)
++                    {
++                        pipeline_convolution_3x3s1d1_winograd43_fused = new Pipeline(vkdev);
++                        pipeline_convolution_3x3s1d1_winograd43_fused->set_local_size_xyz(512, 1, 1);
++                        ret = pipeline_convolution_3x3s1d1_winograd43_fused->create(spirv.data(), spirv.size() * 4, specializations);
++                    }
++                }
++                if (ret != 0)
++                {
++                    NCNN_LOGE("fused winograd43 pipeline unavailable (lds max %u), using the 3-kernel path", lds_max);
++                    delete pipeline_convolution_3x3s1d1_winograd43_fused;
++                    pipeline_convolution_3x3s1d1_winograd43_fused = 0;
++                    use_winograd43_fused = false;
++                    weight_winograd43_fused_data.release();
++                }
+             }
+         }
+ 
+diff --git a/src/layer/vulkan/shader/convolution_pack4_3x3s1d1_winograd43_fused.comp b/src/layer/vulkan/shader/convolution_pack4_3x3s1d1_winograd43_fused.comp
+index c24d521..ceb8f40 100644
+--- a/src/layer/vulkan/shader/convolution_pack4_3x3s1d1_winograd43_fused.comp
++++ b/src/layer/vulkan/shader/convolution_pack4_3x3s1d1_winograd43_fused.comp
+@@ -8,6 +8,7 @@
+ // Fixed geometry (specialised in convolution_vulkan.cpp): pack4 in/out, pad 1, 64 output
+ // channels max (any multiple of 4), input channels any multiple of 4, fp16 storage + arithmetic.
+ //   workgroup  = 512 threads, 4x4 output tiles of 4x4 pixels (16x16 output pixels), all 64 oc
++//   (input transform scratch S[tile][ic quad][6][6] aliases Ys: NT*QPC*36 <= 36*NT*OCH holds for both configs)
+ //   MAC thread = (pgroup g in 0..3: 9 winograd positions) x (tile pair tp in 0..7) x (oc quad o in 0..15)
+ //                -> 9 x 2 x 4 = 72 fp16 accumulators
+ //   X (transformed input) chunk in LDS: [36 pos][16 tiles][16 ic] fp16, 16 input channels per chunk
+@@ -55,14 +56,25 @@ layout (push_constant) uniform parameter
+     int block_y;
+ } p;
+ 
+-#define ICC 16                     // input channels per chunk
++// Shared-memory budget: WINO_ICC input channels per chunk and WINO_OCH oc quads per output pass are
++// injected by convolution_vulkan.cpp (#define before compile): (16, 8) = 55 KB on 64 KB GPUs,
++// (8, 4) = 27.6 KB where maxComputeSharedMemorySize is 32 KB (Apple / MoltenVK).
++#ifndef WINO_ICC
++#define WINO_ICC 16
++#endif
++#ifndef WINO_OCH
++#define WINO_OCH 8
++#endif
++#define ICC WINO_ICC               // input channels per chunk
++#define QPC (ICC / 4)              // ic quads per chunk
++#define OCH WINO_OCH               // oc quads per output pass
+ #define NT 16                      // tiles per workgroup (4x4)
+ #define NTHREADS 512
+ 
+ layout (local_size_x = NTHREADS, local_size_y = 1, local_size_z = 1) in;
+ 
+-shared afpvec2 Xs[36][NT][ICC / 2];        // transformed input chunk, ic pairs      18432 B
+-shared afpvec4 Ys[36 * NT * 8];            // gemm output exchange / transform scratch 36864 B
++shared afpvec2 Xs[36][NT][ICC / 2];        // transformed input chunk, ic pairs      36*16*ICC*2 B
++shared afpvec4 Ys[36 * NT * OCH];          // gemm output exchange / transform scratch (36*16*OCH*8 B)
+ 
+ #define sq2    afp(1.41421356237)
+ #define sq2_m2 afp(2.82842712474)
+@@ -95,11 +107,11 @@ void main()
+     vec4 facc1[9];
+     for (int i = 0; i < 9; i++) { acc0[i] = afpvec4(0.f); acc1[i] = afpvec4(0.f); facc0[i] = vec4(0.f); facc1[i] = vec4(0.f); }
+ 
+-    // ---- input transform thread mapping (384 of 512 threads) ----
+-    // task = (tile t in 0..15, ic quad iq in 0..3, lane j in 0..5)
+-    const bool tf_active = tid < NT * 4 * 6;
+-    const int tf_t = tid / 24;
+-    const int tf_q = (tid / 6) & 3;
++    // ---- input transform thread mapping (NT*QPC*6 of 512 threads) ----
++    // task = (tile t in 0..15, ic quad iq in 0..QPC-1, lane j in 0..5)
++    const bool tf_active = tid < NT * QPC * 6;
++    const int tf_t = tid / (QPC * 6);
++    const int tf_q = (tid / 6) % QPC;
+     const int tf_j = tid - (tid / 6) * 6;
+     const int tile_x = bx * 4 + (tf_t & 3);
+     const int tile_y = by * 4 + (tf_t >> 2);
+@@ -113,9 +125,9 @@ void main()
+         if (tf_active)
+         {
+             afpvec4 v0 = afpvec4(0.f), v1 = afpvec4(0.f), v2 = afpvec4(0.f), v3 = afpvec4(0.f), v4 = afpvec4(0.f), v5 = afpvec4(0.f);
+-            if (tile_valid && sx >= 0 && sx < psc(w) && ch * 4 + tf_q < c)
++            if (tile_valid && sx >= 0 && sx < psc(w) && ch * QPC + tf_q < c)
+             {
+-                const int base = (ch * 4 + tf_q) * psc(cstep) + sx;
++                const int base = (ch * QPC + tf_q) * psc(cstep) + sx;
+                 if (sy0 + 0 >= 0 && sy0 + 0 < psc(h)) v0 = buffer_ld4(bottom_blob_data, base + (sy0 + 0) * psc(w));
+                 if (sy0 + 1 >= 0 && sy0 + 1 < psc(h)) v1 = buffer_ld4(bottom_blob_data, base + (sy0 + 1) * psc(w));
+                 if (sy0 + 2 >= 0 && sy0 + 2 < psc(h)) v2 = buffer_ld4(bottom_blob_data, base + (sy0 + 2) * psc(w));
+@@ -130,7 +142,7 @@ void main()
+             afpvec4 m4 = v4 - v2 * afp(0.5) - v3 * sq2 + v1 * sq2_d2;
+             afpvec4 m5 = v1 - v3 * afp(2.5) + v5;
+             // scratch S[t][q][k][j]
+-            const int sb = ((tf_t * 4 + tf_q) * 6) * 6 + tf_j;
++            const int sb = ((tf_t * QPC + tf_q) * 6) * 6 + tf_j;
+             Ys[sb + 0 * 6] = m0;
+             Ys[sb + 1 * 6] = m1;
+             Ys[sb + 2 * 6] = m2;
+@@ -143,7 +155,7 @@ void main()
+         if (tf_active)
+         {
+             const int k = tf_j;
+-            const int sb = ((tf_t * 4 + tf_q) * 6 + k) * 6;
++            const int sb = ((tf_t * QPC + tf_q) * 6 + k) * 6;
+             afpvec4 m0 = Ys[sb + 0];
+             afpvec4 m1 = Ys[sb + 1];
+             afpvec4 m2 = Ys[sb + 2];
+@@ -198,42 +210,44 @@ void main()
+         barrier();
+     }
+ 
+-    // ---- output transform, in two oc halves through Ys[pos][tile][oc quad (8)] ----
+-    const int ot_t = tid >> 5;            // tile 0..15
+-    const int ot_q = (tid >> 2) & 7;      // oc quad within the half
+-    const int ot_r = tid & 3;             // output row within the 4x4 tile
++    // ---- output transform, in 16/OCH passes of OCH oc quads through Ys[pos][tile][oc quad] ----
++    const int ot_t = tid / (OCH * 4);         // tile 0..15
++    const int ot_q = (tid >> 2) % OCH;        // oc quad within the pass
++    const int ot_r = tid & 3;                 // output row within the 4x4 tile
++    const bool ot_active = tid < NT * OCH * 4;
+     const int otile_x = bx * 4 + (ot_t & 3);
+     const int otile_y = by * 4 + (ot_t >> 2);
+-    const bool otile_valid = otile_x < psc(block_x) && otile_y < psc(block_y);
++    const bool otile_valid = ot_active && otile_x < psc(block_x) && otile_y < psc(block_y);
+ 
+-    for (int hf = 0; hf < 2; hf++)
++    for (int hf = 0; hf < 16 / OCH; hf++)
+     {
+-        if (hf * 8 >= outc)
++        if (hf * OCH >= outc)
+             break;
+-        if ((o >> 3) == hf && o_valid)
++        if ((o / OCH) == hf && o_valid)
+         {
+-            const int oq = o & 7;
++            const int oq = o % OCH;
+             for (int pp = 0; pp < 9; pp++)
+             {
+                 const int pos = g * 9 + pp;
+-                Ys[(pos * NT + tp * 2) * 8 + oq] = acc_fp32 == 1 ? afpvec4(facc0[pp]) : acc0[pp];
+-                Ys[(pos * NT + tp * 2 + 1) * 8 + oq] = acc_fp32 == 1 ? afpvec4(facc1[pp]) : acc1[pp];
++                Ys[(pos * NT + tp * 2) * OCH + oq] = acc_fp32 == 1 ? afpvec4(facc0[pp]) : acc0[pp];
++                Ys[(pos * NT + tp * 2 + 1) * OCH + oq] = acc_fp32 == 1 ? afpvec4(facc1[pp]) : acc1[pp];
+             }
+         }
+         barrier();
++        if (ot_active)
+         {
+             // row r of A^T M: needs v[i][j] for i = 0..5 (vertical), j = 0..5
+             afpvec4 mr[6];
+             for (int j = 0; j < 6; j++)
+             {
+-                const int yb = ot_t * 8 + ot_q;
++                const int yb = ot_t * OCH + ot_q;
+                 // v_i = value at (horizontal j, vertical i) = position j*6 + i
+-                afpvec4 v0 = Ys[(j * 6 + 0) * NT * 8 + yb];
+-                afpvec4 v1 = Ys[(j * 6 + 1) * NT * 8 + yb];
+-                afpvec4 v2 = Ys[(j * 6 + 2) * NT * 8 + yb];
+-                afpvec4 v3 = Ys[(j * 6 + 3) * NT * 8 + yb];
+-                afpvec4 v4 = Ys[(j * 6 + 4) * NT * 8 + yb];
+-                afpvec4 v5 = Ys[(j * 6 + 5) * NT * 8 + yb];
++                afpvec4 v0 = Ys[(j * 6 + 0) * NT * OCH + yb];
++                afpvec4 v1 = Ys[(j * 6 + 1) * NT * OCH + yb];
++                afpvec4 v2 = Ys[(j * 6 + 2) * NT * OCH + yb];
++                afpvec4 v3 = Ys[(j * 6 + 3) * NT * OCH + yb];
++                afpvec4 v4 = Ys[(j * 6 + 4) * NT * OCH + yb];
++                afpvec4 v5 = Ys[(j * 6 + 5) * NT * OCH + yb];
+                 if (ot_r == 0) mr[j] = v0 + v1 + v2 + v3 + v4;
+                 else if (ot_r == 1) mr[j] = (v1 - v2) * sq2_d2 + (v3 - v4) * sq2;
+                 else if (ot_r == 2) mr[j] = (v1 + v2) * afp(0.5) + (v3 + v4) * afp(2);
+@@ -244,7 +258,7 @@ void main()
+             afpvec4 out2 = (mr[1] + mr[2]) * afp(0.5) + (mr[3] + mr[4]) * afp(2);
+             afpvec4 out3 = mr[5] + (mr[1] - mr[2]) * sq2_d4 + (mr[3] - mr[4]) * sq2_m2;
+ 
+-            const int ocq = hf * 8 + ot_q;
++            const int ocq = hf * OCH + ot_q;
+             const bool ocq_valid = ocq < outc;
+             if (bias_term == 1 && ocq_valid)
+             {
+-- 
+2.55.0
+

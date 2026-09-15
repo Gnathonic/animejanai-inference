@@ -1,7 +1,7 @@
 From acc5a5e646ce6d6dfc2ae0ae012543c59105e833 Mon Sep 17 00:00:00 2001
 From: Nathan Rogers <gnathonic@gmail.com>
 Date: Tue, 15 Sep 2026 15:25:36 -0700
-Subject: [PATCH 2/2] fused winograd43: default on all GPUs (narrow inputs keep
+Subject: [PATCH 2/3] fused winograd43: default on all GPUs (narrow inputs keep
  coopmat gemm), per-GPU accumulation mode
 
 fp32 running sums (fp16 per 16-channel chunk) only on AMD coopmat GPUs where they are free;

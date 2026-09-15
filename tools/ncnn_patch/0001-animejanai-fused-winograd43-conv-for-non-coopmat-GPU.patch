@@ -1,7 +1,7 @@
 From 56c91fee139f861b17de236b26bcf028b0c2d512 Mon Sep 17 00:00:00 2001
 From: Nathan Rogers <gnathonic@gmail.com>
 Date: Tue, 15 Sep 2026 15:18:52 -0700
-Subject: [PATCH 1/2] animejanai: fused winograd43 conv for non-coopmat GPUs,
+Subject: [PATCH 1/3] animejanai: fused winograd43 conv for non-coopmat GPUs,
  SpabTail fused layer, GridSample Vulkan layer
 
 - convolution_vulkan: single-dispatch fused winograd F(4x4,3x3) (transforms staged in LDS, no
