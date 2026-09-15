@@ -178,21 +178,22 @@ static bool load_backend(const char *stem, aji_backend *be,
     return true;
 }
 
-extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
-{
-    if (!params || params->api_version != AJI_API_VERSION)
-        return nullptr;
+/* Map the conf's [global] backend= value to the sibling library stem and the short
+ * key reported by aji_backend_probe(). Direct mode (no conf) is the TRT harness path. */
+struct backend_choice { const char *stem; const char *key; };
 
-    /* 3.3.x semantics: backend lives in [global] of animejanai.conf;
-     * direct mode (no conf) is the TRT harness path */
+static backend_choice resolve_backend(const char *conf_path, std::string *backend_out,
+                                      aji_log_fn log, void *log_opaque)
+{
+    /* 3.3.x semantics: backend lives in [global] of animejanai.conf */
     std::string backend = "TensorRT";
-    if (params->conf_path) {
+    if (conf_path) {
         AjiConf conf;
         std::string err;
-        if (aji_conf_load(params->conf_path, &conf, &err))
+        if (aji_conf_load(conf_path, &conf, &err))
             backend = conf.backend;
-        else
-            logf_to(params->log, params->log_opaque, 2,
+        else if (log)
+            logf_to(log, log_opaque, 2,
                     "conf parse failed (%s), using TensorRT", err.c_str());
     }
 
@@ -200,17 +201,36 @@ extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
     for (char ch : backend)
         lower.push_back((char)tolower((unsigned char)ch));
 
-    const char *stem = "aji_trt";
+    backend_choice c = {"aji_trt", "trt"};
     if (lower == "directml") {
-        stem = "aji_dml";
+        c = {"aji_dml", "dml"};
     } else if (lower == "rocm") {
         /* AMD ROCm/MIGraphX backend — the fastest Linux/AMD upscale path */
-        stem = "aji_rocm";
+        c = {"aji_rocm", "rocm"};
     } else if (lower == "vulkan" || lower == "ncnn") {
-        /* ncnn-Vulkan backend — the portable Linux/AMD path (no ROCm install
-         * required), and ~2.4x faster than ROCm on the warp-heavy RIFE pipeline */
-        stem = "aji_vk";
+        /* ncnn-Vulkan backend — the portable path (any Vulkan GPU, incl. MoltenVK on
+         * macOS; no ROCm install required), and ~2.4x faster than ROCm on the
+         * warp-heavy RIFE pipeline */
+        c = {"aji_vk", "vk"};
     }
+    if (backend_out) *backend_out = backend;
+    return c;
+}
+
+extern "C" AJI_EXPORT const char *aji_backend_probe(const char *conf_path)
+{
+    return resolve_backend(conf_path, nullptr, nullptr, nullptr).key;
+}
+
+extern "C" AJI_EXPORT aji_ctx *aji_create(const aji_create_params *params)
+{
+    if (!params || params->api_version != AJI_API_VERSION)
+        return nullptr;
+
+    std::string backend;
+    const backend_choice choice = resolve_backend(params->conf_path, &backend,
+                                                  params->log, params->log_opaque);
+    const char *stem = choice.stem;
 
     aji_backend be = {};
     std::string err;
